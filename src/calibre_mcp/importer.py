@@ -86,6 +86,15 @@ class AddResult:
     duplicate_titles: list[str]
 
 
+def _diagnostic_tail(stdout: str | bytes | None, stderr: str | bytes | None) -> str:
+    def text(output: str | bytes | None) -> str:
+        if isinstance(output, bytes):
+            return output.decode("utf-8", errors="replace").strip()
+        return (output or "").strip()
+
+    return " | ".join((text(stderr) or text(stdout)).splitlines()[-5:])
+
+
 def parse_output(stdout: str, stderr: str = "") -> AddResult:
     """Read stdout results and Calibre's explicit duplicate report on stderr."""
     added, merged, titles = [], [], []
@@ -96,7 +105,7 @@ def parse_output(stdout: str, stderr: str = "") -> AddResult:
             try:
                 ids = [int(i.strip()) for i in match[2].split(",")]
             except ValueError as exc:
-                raise AddError("calibredb added nothing: " + " | ".join(stdout.splitlines()[-5:]), 502) from exc
+                raise AddError("calibredb added nothing: " + _diagnostic_tail(stdout, stderr), 502) from exc
             (added if match[1] == "Added" else merged).extend(ids)
         elif "already exist in the database" in line:
             duplicate = True
@@ -117,7 +126,7 @@ def parse_output(stdout: str, stderr: str = "") -> AddResult:
                 titles.append(title.strip())
             if titles:
                 return AddResult("duplicate", [], titles)
-    raise AddError("calibredb added nothing: " + " | ".join(stdout.strip().splitlines()[-5:]), 502)
+    raise AddError("calibredb added nothing: " + _diagnostic_tail(stdout, stderr), 502)
 
 
 class Importer:
@@ -160,11 +169,12 @@ class Importer:
             try:
                 proc = subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout, env=env)
             except subprocess.TimeoutExpired as exc:
-                raise AddError(f"calibredb timed out after {self.timeout}s", 502) from exc
+                tail = _diagnostic_tail(exc.stdout, exc.stderr)
+                message = f"calibredb timed out after {self.timeout}s"
+                raise AddError(message + (": " + tail if tail else ""), 502) from exc
         if LOCKED in proc.stdout or LOCKED in proc.stderr:
             raise AddError("the library is open in another Calibre program (desktop app or calibre-server); "
                            "close it and retry", 503)
         if proc.returncode != 0:
-            tail = (proc.stderr or proc.stdout).strip().splitlines()[-5:]
-            raise AddError("calibredb failed: " + " | ".join(tail), 502)
+            raise AddError("calibredb failed: " + _diagnostic_tail(proc.stdout, proc.stderr), 502)
         return proc.stdout, proc.stderr

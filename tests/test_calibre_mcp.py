@@ -10,6 +10,7 @@ from contextlib import redirect_stdout
 import os
 import sqlite3
 import stat
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -311,6 +312,26 @@ class AddBookTest(unittest.TestCase):
                 r = c.post("/main/books?filename=x.epub", content=b"x")
                 self.assertEqual(r.status_code, 201)
                 self.assertEqual([book["id"] for book in r.json()["books"]], [1])
+
+    def test_unrecognized_import_output_retains_stderr_diagnostic(self):
+        proc = subprocess.CompletedProcess("calibredb", 0, stdout="", stderr=(
+            "omit\na\nb\nc\nd\nreader failed: useful diagnostic\n"))
+        with TestClient(self.app) as c, patch("calibre_mcp.importer.subprocess.run", return_value=proc):
+            r = c.post("/main/books?filename=x.epub", content=b"x")
+        self.assertEqual(r.status_code, 502)
+        self.assertEqual(r.json(), {"error":
+                         "calibredb added nothing: a | b | c | d | reader failed: useful diagnostic"})
+        self.assertEqual(list((self.cfg.cache_dir / "uploads").iterdir()), [])
+
+    def test_import_timeout_retains_stderr_diagnostic(self):
+        timeout = subprocess.TimeoutExpired("calibredb", self.cfg.add_timeout, output=b"ignored stdout", stderr=(
+            b"omit\na\nb\nc\nd\nreader stalled: useful diagnostic \xff\n"))
+        with TestClient(self.app) as c, patch("calibre_mcp.importer.subprocess.run", side_effect=timeout):
+            r = c.post("/main/books?filename=x.epub", content=b"x")
+        self.assertEqual(r.status_code, 502)
+        self.assertEqual(r.json(), {"error": f"calibredb timed out after {self.cfg.add_timeout}s: "
+                         "a | b | c | d | reader stalled: useful diagnostic \ufffd"})
+        self.assertEqual(list((self.cfg.cache_dir / "uploads").iterdir()), [])
 
     def test_discovery_and_search_after_upload(self):
         from mcp import Client

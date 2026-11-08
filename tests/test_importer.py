@@ -108,6 +108,21 @@ class ParseOutputTest(unittest.TestCase):
                 parse_output("    /tmp/inbox/book.txt\n", stderr)
             self.assertEqual(caught.exception.status, 502)
 
+    def test_failure_diagnostic_tail(self) -> None:
+        for stdout in ("", "unrecognized stdout", "Added book ids: nope"):
+            with self.subTest(stdout=stdout), self.assertRaises(AddError) as caught:
+                parse_output(stdout, "omit\na\nb\nc\nd\nreader failed: useful diagnostic\n")
+            self.assertEqual(caught.exception.status, 502)
+            self.assertEqual(str(caught.exception),
+                             "calibredb added nothing: a | b | c | d | reader failed: useful diagnostic")
+
+    def test_failure_diagnostic_falls_back_to_stdout(self) -> None:
+        for stderr in ("", " \n"):
+            with self.subTest(stderr=stderr), self.assertRaises(AddError) as caught:
+                parse_output("omit\na\nb\nc\nd\nstdout diagnostic\n", stderr)
+            self.assertEqual(caught.exception.status, 502)
+            self.assertEqual(str(caught.exception), "calibredb added nothing: a | b | c | d | stdout diagnostic")
+
     def test_garbage(self) -> None:
         for stdout in ("", "file not found", "Added book ids: nope", "unexpected output"):
             with self.subTest(stdout=stdout), self.assertRaisesRegex(AddError, "calibredb added nothing") as caught:
@@ -206,6 +221,25 @@ class ImporterTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(AddError, "calibredb timed out after 1s") as caught:
             await importer.add(self.library, self.book, BookMetadata())
         self.assertEqual(caught.exception.status, 502)
+
+    async def test_timeout_diagnostic_tail(self) -> None:
+        cases = [
+            ("ignored stdout", "omit\na\nb\nc\nd\nreader stalled", "a | b | c | d | reader stalled"),
+            (b"ignored stdout", b"omit\na\nb\nc\nd\nreader stalled: \xff", "a | b | c | d | reader stalled: \ufffd"),
+            ("omit\na\nb\nc\nd\nstdout diagnostic", "", "a | b | c | d | stdout diagnostic"),
+            (b"omit\na\nb\nc\nd\nstdout diagnostic: \xff", b"", "a | b | c | d | stdout diagnostic: \ufffd"),
+            ("stdout diagnostic", " \n", "stdout diagnostic"),
+            (None, None, ""),
+            (b"", b"", ""),
+        ]
+        for stdout, stderr, tail in cases:
+            timeout = subprocess.TimeoutExpired("calibredb", self.importer.timeout, output=stdout, stderr=stderr)
+            with self.subTest(stdout=stdout, stderr=stderr), patch(
+                "calibre_mcp.importer.subprocess.run", side_effect=timeout
+            ), self.assertRaises(AddError) as caught:
+                await self.importer.add(self.library, self.book, BookMetadata())
+            self.assertEqual(caught.exception.status, 502)
+            self.assertEqual(str(caught.exception), "calibredb timed out after 300s" + (": " + tail if tail else ""))
 
     async def test_unavailable(self) -> None:
         importer = Importer(str(self.root / "missing-exe"))
