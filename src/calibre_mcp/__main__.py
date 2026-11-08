@@ -62,8 +62,9 @@ def main(argv: list[str] | None = None) -> None:
 
     from .server import build_app
 
+    # Access logs include upload URLs, which contain full capability IDs.
     uvicorn.run(build_app(cfg), host=cfg.host, port=cfg.port, proxy_headers=True, forwarded_allow_ips="*",
-                log_level="info")
+                log_level="info", access_log=False)
 
 
 if __name__ == "__main__":

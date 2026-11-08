@@ -427,6 +427,16 @@ class AddBookTest(unittest.TestCase):
             self.assertEqual(len(cat.stager), 0)
         asyncio.run(run())
 
+    def test_serve_disables_access_logs_to_protect_upload_capabilities(self):
+        from calibre_mcp.__main__ import main
+
+        with patch("uvicorn.run") as run, patch.dict(os.environ, {}, clear=True):
+            main(["serve", "-l", f"main={self.root / 'lib'}", "--no-convert",
+                  "--cache-dir", str(self.cfg.cache_dir), "--calibredb", self.cfg.calibredb])
+        run.assert_called_once()
+        self.assertIs(run.call_args.kwargs["access_log"], False)
+        self.assertEqual(run.call_args.args[0].state.catalog.default, "main")
+
     def test_allowed_origin_startup_sweep_and_check(self):
         self.cfg.allowed_hosts = ["other.test", "books.test"]
         for prefix in (".upload-", ".staged-"):
