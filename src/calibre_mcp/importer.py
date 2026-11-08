@@ -17,6 +17,8 @@ log = logging.getLogger("calibre_mcp")
 Duplicates = Literal["refuse", "new_record", "merge"]
 DUPLICATES: tuple[str, ...] = ("refuse", "new_record", "merge")
 LOCKED = "Another calibre program"
+_DUPLICATE_HEADER = ("The following books were not added as they already exist in the database "
+                     "(see --duplicates option or --automerge option):")
 
 
 class AddError(RuntimeError):
@@ -84,8 +86,8 @@ class AddResult:
     duplicate_titles: list[str]
 
 
-def parse_output(stdout: str) -> AddResult:
-    """Interpret calibredb add stdout independently of reader noise on stderr."""
+def parse_output(stdout: str, stderr: str = "") -> AddResult:
+    """Read stdout results and Calibre's explicit duplicate report on stderr."""
     added, merged, titles = [], [], []
     duplicate = False
     for line in stdout.splitlines():
@@ -104,6 +106,17 @@ def parse_output(stdout: str) -> AddResult:
         return AddResult("added" if added else "merged", added + merged, titles)
     if duplicate:
         return AddResult("duplicate", [], titles)
+    # Calibre 8.5 writes duplicate headers/titles to stderr, but paths to stdout.
+    lines = stderr.splitlines()
+    for index, line in enumerate(lines):
+        if line == _DUPLICATE_HEADER:
+            titles = []
+            for title in lines[index + 1:]:
+                if not title.startswith("  ") or title.startswith("   "):
+                    break
+                titles.append(title.strip())
+            if titles:
+                return AddResult("duplicate", [], titles)
     raise AddError("calibredb added nothing: " + " | ".join(stdout.strip().splitlines()[-5:]), 502)
 
 
@@ -138,10 +151,10 @@ class Importer:
         lock = self._locks.setdefault(str(library_root), asyncio.Lock())
         async with lock:
             log.info("adding %s to %s", src.name, library_root)
-            stdout = await asyncio.to_thread(self._run, cmd)
-        return parse_output(stdout)
+            stdout, stderr = await asyncio.to_thread(self._run, cmd)
+        return parse_output(stdout, stderr)
 
-    def _run(self, cmd: list[str]) -> str:
+    def _run(self, cmd: list[str]) -> tuple[str, str]:
         with tempfile.TemporaryDirectory(prefix="calibre-mcp-add-") as tmp:
             env = dict(os.environ, HOME=tmp, QT_QPA_PLATFORM="offscreen")
             try:
@@ -154,4 +167,4 @@ class Importer:
         if proc.returncode != 0:
             tail = (proc.stderr or proc.stdout).strip().splitlines()[-5:]
             raise AddError("calibredb failed: " + " | ".join(tail), 502)
-        return proc.stdout
+        return proc.stdout, proc.stderr

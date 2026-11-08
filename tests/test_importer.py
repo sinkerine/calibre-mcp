@@ -90,6 +90,24 @@ class ParseOutputTest(unittest.TestCase):
                                       "  First title\n    /path/one.txt\n  Second title\n    /path/two.txt\n"),
                          AddResult("duplicate", [], ["First title", "Second title"]))
 
+    def test_calibre_8_5_duplicate_report_on_stderr(self) -> None:
+        stdout = "    /tmp/calibre-packaging-probe/inbox/book.txt\n"
+        stderr = ("The following books were not added as they already exist in the database "
+                  "(see --duplicates option or --automerge option):\n"
+                  "  Importer test book\n")
+        self.assertEqual(parse_output(stdout, stderr), AddResult("duplicate", [], ["Importer test book"]))
+        self.assertEqual(parse_output(stdout, stderr + "  Second title\nTraceback: reader noise\n  ignored\n"),
+                         AddResult("duplicate", [], ["Importer test book", "Second title"]))
+
+    def test_stderr_requires_explicit_duplicate_report(self) -> None:
+        for stderr in ("Traceback: bad format\nMerged book ids: 99\nAdded book ids: 10\n",
+                       "Traceback: books already exist in the database\n  Not a duplicate title\n",
+                       "The following books were not added as they already exist in the database "
+                       "(see --duplicates option or --automerge option):\nTraceback: reader failure\n"):
+            with self.subTest(stderr=stderr), self.assertRaises(AddError) as caught:
+                parse_output("    /tmp/inbox/book.txt\n", stderr)
+            self.assertEqual(caught.exception.status, 502)
+
     def test_garbage(self) -> None:
         for stdout in ("", "file not found", "Added book ids: nope", "unexpected output"):
             with self.subTest(stdout=stdout), self.assertRaisesRegex(AddError, "calibredb added nothing") as caught:
@@ -149,6 +167,21 @@ class ImporterTest(unittest.IsolatedAsyncioTestCase):
         self.control.write_text(json.dumps({"stderr": "Traceback: bad format\nMerged book ids: 99"}))
         result = await self.importer.add(self.library, self.book, BookMetadata())
         self.assertEqual(result, AddResult("added", [4], []))
+
+    async def test_calibre_8_5_duplicate_report_on_stderr(self) -> None:
+        self.control.write_text(json.dumps({
+            "stdout": f"    {self.book}\n",
+            "stderr": ("The following books were not added as they already exist in the database "
+                       "(see --duplicates option or --automerge option):\n"
+                       "  Importer test book\n"),
+        }))
+        result = await self.importer.add(self.library, self.book, BookMetadata())
+        self.assertEqual(result, AddResult("duplicate", [], ["Importer test book"]))
+        self.control.write_text(json.dumps({"stdout": f"    {self.book}\n",
+                                           "stderr": "Traceback: reader failure\nMerged book ids: 99\n"}))
+        with self.assertRaisesRegex(AddError, "calibredb added nothing") as caught:
+            await self.importer.add(self.library, self.book, BookMetadata())
+        self.assertEqual(caught.exception.status, 502)
 
     async def test_errors(self) -> None:
         cases = [({"stderr": LOCKED, "exit": 1}, "library is open in another Calibre program", 503),
@@ -213,7 +246,7 @@ class ImporterTest(unittest.IsolatedAsyncioTestCase):
             calls.append(library)
             await asyncio.sleep(0)
             active.remove(library)
-            return "Added book ids: 4"
+            return "Added book ids: 4", ""
 
         with patch("calibre_mcp.importer.asyncio.to_thread", side_effect=run):
             await asyncio.gather(*(self.importer.add(self.library, self.book, BookMetadata()) for _ in range(3)))
