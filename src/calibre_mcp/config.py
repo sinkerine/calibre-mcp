@@ -8,6 +8,9 @@
     ebook_convert = "ebook-convert"
     convert_timeout = 900      # seconds
     allowed_hosts = []         # Host headers /mcp accepts; empty = any (the proxy decides who gets in)
+    calibredb = "calibredb"     # executable used to add books
+    add_timeout = 300          # seconds
+    max_upload_mb = 1024       # maximum upload size in MiB
 
     [[libraries]]              # one or more Calibre libraries (directories holding metadata.db)
     name = "main"
@@ -15,7 +18,8 @@
 
 Environment: CALIBRE_MCP_CONFIG (file), CALIBRE_MCP_LIBRARIES ("main=/books,other=/other"),
 CALIBRE_MCP_HOST, CALIBRE_MCP_PORT, CALIBRE_MCP_PUBLIC_URL, CALIBRE_MCP_CACHE_DIR,
-CALIBRE_MCP_CONVERT (0/1), CALIBRE_MCP_EBOOK_CONVERT, CALIBRE_MCP_ALLOWED_HOSTS (comma-separated).
+CALIBRE_MCP_CONVERT (0/1), CALIBRE_MCP_EBOOK_CONVERT, CALIBRE_MCP_ALLOWED_HOSTS (comma-separated),
+CALIBRE_MCP_CALIBREDB, CALIBRE_MCP_MAX_UPLOAD_MB (integer).
 """
 
 from __future__ import annotations
@@ -46,6 +50,9 @@ class Config:
     ebook_convert: str = "ebook-convert"
     convert_timeout: int = 900
     allowed_hosts: list[str] = field(default_factory=list)
+    calibredb: str = "calibredb"
+    add_timeout: int = 300
+    max_upload_mb: int = 1024
 
     def validate(self) -> None:
         if not self.libraries:
@@ -59,6 +66,10 @@ class Config:
             seen.add(lib.name)
             if not (lib.path / "metadata.db").is_file():
                 raise SystemExit(f"library {lib.name!r}: no metadata.db in {lib.path}")
+        if self.max_upload_mb < 1:
+            raise SystemExit("max_upload_mb must be at least 1")
+        if self.add_timeout < 1:
+            raise SystemExit("add_timeout must be at least 1")
 
 
 def _bool(value: str) -> bool:
@@ -92,6 +103,9 @@ def load_config(path: Path | None = None, env: dict[str, str] | None = None) -> 
         ebook_convert=str(raw.get("ebook_convert", "ebook-convert")),
         convert_timeout=int(raw.get("convert_timeout", 900)),
         allowed_hosts=list(raw.get("allowed_hosts", [])),
+        calibredb=str(raw.get("calibredb", "calibredb")),
+        add_timeout=int(raw.get("add_timeout", 300)),
+        max_upload_mb=int(raw.get("max_upload_mb", 1024)),
     )
     if v := env.get("CALIBRE_MCP_LIBRARIES"):
         cfg.libraries = _libraries(v)
@@ -109,5 +123,9 @@ def load_config(path: Path | None = None, env: dict[str, str] | None = None) -> 
         cfg.ebook_convert = v
     if v := env.get("CALIBRE_MCP_ALLOWED_HOSTS"):
         cfg.allowed_hosts = [h.strip() for h in v.split(",") if h.strip()]
+    if v := env.get("CALIBRE_MCP_CALIBREDB"):
+        cfg.calibredb = v
+    if v := env.get("CALIBRE_MCP_MAX_UPLOAD_MB"):
+        cfg.max_upload_mb = int(v)
     cfg.public_url = cfg.public_url.rstrip("/")
     return cfg
