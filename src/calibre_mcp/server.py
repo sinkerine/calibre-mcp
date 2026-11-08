@@ -8,6 +8,7 @@ HTTP (no auth; put it behind a proxy that limits who can reach it):
     GET /<library>/books/<id>/<format>         a book file, e.g. /main/books/1037/epub, /main/books/12/mobi
     GET /<library>/books/<id>/epub             the EPUB, converted on demand when the book has none
     GET /<library>/books/<id>/cover.jpg
+    POST /<library>/books                      upload and add a book via calibredb
     POST /mcp                                  MCP (streamable HTTP, stateless)
 """
 
@@ -19,7 +20,7 @@ import re
 import unicodedata
 from collections.abc import Mapping
 from typing import Literal
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
@@ -29,19 +30,23 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response
 
-from . import __version__
+from . import __version__, upload
 from .config import Config
 from .convert import ConvertError, Converter
+from .importer import AddError, Importer
 from .library import Library
 
 log = logging.getLogger("calibre_mcp")
 
 INSTRUCTIONS = """\
-Read-only access to Calibre ebook libraries. Find books with search_books (words match title, authors, tags
+Read-only tools for Calibre ebook libraries. Find books with search_books (words match title, authors, tags
 and series; filters narrow it), inspect one with get_book, and browse authors/tags/series with
 browse_library. Every book comes with direct HTTP download URLs for each stored format, an `epub_url`
 (converted on demand when the book has no EPUB; the first request can take a minute) and a cover URL.
-Book ids are per library; omit `library` to use the default one."""
+Book ids are per library; omit `library` to use the default one.
+To add a book, POST the file to the library's `add_url` (e.g. `curl -F file=@book.epub <add_url>`;
+optional fields title, authors, tags, series, series_index, languages, identifier=type:value,
+duplicates=refuse|new_record|merge)."""
 READ = ToolAnnotations(read_only_hint=True, open_world_hint=False, idempotent_hint=True)
 MEDIA = {".epub": "application/epub+zip", ".mobi": "application/x-mobipocket-ebook",
          ".azw3": "application/vnd.amazon.ebook", ".azw": "application/vnd.amazon.ebook",
@@ -58,6 +63,21 @@ def disposition(name: str, fallback: str) -> str:
     return f"attachment; filename=\"{ascii_name}\"; filename*=utf-8''{quote(name)}"
 
 
+def same_origin(request: Request, allowed_hosts: list[str]) -> bool:
+    """Allow scripts and browser requests from the request host or configured hosts."""
+    origin = request.headers.get("origin")
+    if origin is None:
+        return True
+    try:
+        parsed = urlsplit(origin)
+        host = parsed.netloc.lower()
+    except ValueError:
+        return False
+    target = (request.headers.get("x-forwarded-host") or request.headers.get("host", "")).split(",")[0].strip()
+    return bool(host and parsed.scheme in ("http", "https")
+                and (host == target.lower() or host in [h.lower() for h in allowed_hosts]))
+
+
 class Catalog:
     """The configured libraries, the converter and URL building."""
 
@@ -65,9 +85,17 @@ class Catalog:
         self.cfg = cfg
         self.libraries = {lib.name: Library(lib.name, lib.path) for lib in cfg.libraries}
         self.default = cfg.libraries[0].name
+        self.importer = Importer(cfg.calibredb, timeout=cfg.add_timeout)
+        self.upload_root = cfg.cache_dir / "uploads"
+        self.max_upload = cfg.max_upload_mb * 1024 * 1024
+        log.info("adding books %s (calibredb: %s)", "enabled" if self.can_add else "disabled", cfg.calibredb)
         self.converter = Converter(cfg.ebook_convert, cfg.cache_dir, timeout=cfg.convert_timeout)
         if cfg.convert and not self.converter.available:
             log.warning("ebook-convert not found; books without an EPUB get no epub_url")
+
+    @property
+    def can_add(self) -> bool:
+        return self.importer.available
 
     @property
     def can_convert(self) -> bool:
@@ -104,6 +132,7 @@ class Catalog:
 def build_app(cfg: Config) -> Starlette:
     cfg.validate()
     cat = Catalog(cfg)
+    upload.sweep(cat.upload_root)
     mcp = MCPServer("calibre-mcp", instructions=INSTRUCTIONS, version=__version__)
 
     def lib_or_error(name: str | None) -> Library:
@@ -115,10 +144,12 @@ def build_app(cfg: Config) -> Starlette:
     # -- MCP tools ------------------------------------------------------------------
 
     @mcp.tool(annotations=READ)
-    def list_libraries() -> dict:
+    def list_libraries(ctx: Context) -> dict:
         """The Calibre libraries served here, with book counts and stored formats."""
-        return {"default": cat.default, "convert_to_epub": cat.can_convert,
-                "libraries": [{"name": lib.name, "books": lib.count(), "formats": lib.formats()}
+        base = cat.base_url(ctx.headers)
+        return {"default": cat.default, "convert_to_epub": cat.can_convert, "add_books": cat.can_add,
+                "libraries": [{"name": lib.name, "books": lib.count(), "formats": lib.formats(),
+                               **({"add_url": f"{base}/{lib.name}/books"} if cat.can_add else {})}
                               for lib in cat.libraries.values()]}
 
     @mcp.tool(annotations=READ)
@@ -170,7 +201,46 @@ def build_app(cfg: Config) -> Starlette:
     async def index(request: Request) -> Response:
         return JSONResponse({"service": "calibre-mcp", "version": __version__, "mcp": "/mcp",
                              "libraries": {n: f"/{n}/books/<id>" for n in cat.libraries},
-                             "convert_to_epub": cat.can_convert})
+                             "convert_to_epub": cat.can_convert, "add_books": cat.can_add,
+                             "add": "POST /<library>/books"})
+
+    @mcp.custom_route("/{library}/books", methods=["POST"])
+    async def add_book(request: Request) -> Response:
+        """Upload a book file and add it with calibredb."""
+        if not same_origin(request, cfg.allowed_hosts):
+            return JSONResponse({"error": "cross-origin upload refused"}, status_code=403)
+        lib = cat.libraries.get(request.path_params["library"])
+        if lib is None:
+            return not_found("no such library")
+        if not cat.can_add:
+            return JSONResponse({"error": "calibredb is not installed; adding books needs Calibre"}, status_code=503)
+        try:
+            async with upload.receive(request, cat.upload_root, cat.max_upload) as up:
+                result = await cat.importer.add(lib.root, up.path, up.metadata, up.duplicates)
+        except (upload.UploadError, AddError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=exc.status)
+        base = cat.base_url(request.headers)
+        if result.status == "duplicate":
+            existing = {}
+            for title in result.duplicate_titles:
+                _, books = lib.search(title, limit=10)
+                for book in books:
+                    if len(existing) < 10:
+                        existing[book["id"]] = book | cat.links(lib, book, base)
+            return JSONResponse({"status": "duplicate", "library": lib.name,
+                                 "message": "already in the library: " + "; ".join(result.duplicate_titles)
+                                 + "; send duplicates=new_record or duplicates=merge",
+                                 "existing": list(existing.values())}, status_code=409)
+        books = []
+        for bid in result.book_ids:
+            book = lib.book(bid)
+            if book is not None:
+                books.append(book | cat.links(lib, book, base))
+        if not books:
+            return JSONResponse({"error": "calibredb reported no readable books"}, status_code=502)
+        return JSONResponse({"status": result.status, "library": lib.name, "books": books},
+                            status_code=201 if result.status == "added" else 200,
+                            headers={"Location": f"{base}/{lib.name}/books/{books[0]['id']}"})
 
     @mcp.custom_route("/health", methods=["GET"])
     async def health(request: Request) -> Response:

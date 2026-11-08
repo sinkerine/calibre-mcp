@@ -22,6 +22,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--public-url", help="base URL for returned links (default: from each request)")
     parser.add_argument("--cache-dir", type=Path, help="where converted EPUBs are kept")
     parser.add_argument("--no-convert", action="store_true", help="do not convert books to EPUB")
+    parser.add_argument("--calibredb", help="path to calibredb for adding books")
+    parser.add_argument("--max-upload-mb", type=int, help="maximum upload size in MiB")
     args = parser.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -30,7 +32,7 @@ def main(argv: list[str] | None = None) -> None:
         for spec in args.library:
             name, sep, path = spec.partition("=")
             cfg.libraries.append(LibraryConfig(name, Path(path)) if sep else LibraryConfig(Path(spec).name, Path(spec)))
-    for key in ("host", "port", "cache_dir"):
+    for key in ("host", "port", "cache_dir", "calibredb", "max_upload_mb"):
         if getattr(args, key) is not None:
             setattr(cfg, key, getattr(args, key))
     if args.public_url:
@@ -49,6 +51,8 @@ def main(argv: list[str] | None = None) -> None:
             print(json.dumps({"library": lib.name, "path": str(lib.root), "books": total, "formats": lib.formats(),
                               "recent": [f"{b['id']}: {b['title']}" for b in recent]}, ensure_ascii=False, indent=2))
         print(f"convert to EPUB: {'yes' if cat.can_convert else 'no'} (cache: {cfg.cache_dir})")
+        print(f"add books: {'yes' if cat.can_add else 'no'} "
+              f"(calibredb: {cfg.calibredb if cat.can_add else 'missing'}; max upload: {cfg.max_upload_mb} MB)")
         return
 
     import uvicorn

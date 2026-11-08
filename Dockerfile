@@ -1,5 +1,5 @@
 # calibre-mcp. Build: docker build -t calibre-mcp .   (--build-arg WITH_CALIBRE=0 for a slim image
-# without ebook-convert: books lacking an EPUB then get no epub_url)
+# without ebook-convert: books lacking an EPUB then get no epub_url; also disables adding books)
 FROM python:3.13-slim
 
 ARG WITH_CALIBRE=1

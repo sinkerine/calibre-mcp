@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import io
+import sys
+from contextlib import redirect_stdout
 import os
 import sqlite3
 import stat
@@ -11,6 +14,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from urllib.parse import unquote
+from unittest.mock import AsyncMock, patch
 
 from starlette.testclient import TestClient
 
@@ -143,6 +147,9 @@ class CalibreMcpTest(unittest.TestCase):
                     self.assertEqual(names, {"list_libraries", "search_books", "get_book", "browse_library"})
                     libs = await call(client, "list_libraries")
                     self.assertEqual(libs["libraries"][0]["books"], 3)
+                    self.assertEqual(libs["add_books"], self.app.state.catalog.can_add)
+                    if libs["add_books"]:
+                        self.assertEqual(libs["libraries"][0]["add_url"], "http://calibre.test/main/books")
                     res = await call(client, "search_books", query="cooking")
                     self.assertEqual([b["id"] for b in res["books"]], [1, 2])  # title hit first, tag hit second
                     self.assertEqual(res["books"][0]["epub_url"], "http://calibre.test/main/books/1/epub")
@@ -162,6 +169,191 @@ class CalibreMcpTest(unittest.TestCase):
                     self.assertEqual(tags["items"], [{"name": "Cooking", "books": 2}])
 
         asyncio.run(main())
+
+
+
+
+
+def fake_calibredb(path: Path) -> Path:
+    path.write_text(f"#!{sys.executable}\n" + r'''import json
+import pathlib
+import shutil
+import sqlite3
+import sys
+args = sys.argv[1:]
+assert args[0] == "add"
+root = pathlib.Path(args[args.index("--with-library") + 1])
+src = pathlib.Path(args[args.index("--") + 1])
+(root / "last-args.json").write_text(json.dumps(args))
+def option(key, default):
+    return args[args.index(key) + 1] if key in args else default
+title = option("--title", src.stem)
+author = option("--authors", "Unknown")
+db = sqlite3.connect(root / "metadata.db")
+old = db.execute("SELECT id FROM books WHERE title=? AND author_sort=?", (title, author)).fetchone()
+if old and "--duplicates" not in args:
+    if "--automerge" in args and not db.execute("SELECT 1 FROM data WHERE book=? AND format=?",
+                                               (old[0], src.suffix[1:].upper())).fetchone():
+        bid = old[0]
+        status = "Merged"
+    else:
+        print("The following books were not added as they already exist in the database:")
+        print("  " + title)
+        sys.exit(0)
+else:
+    bid = db.execute("SELECT MAX(id)+1 FROM books").fetchone()[0]
+    rel = f"{author}/{title} ({bid})"
+    db.execute("INSERT INTO books VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+               (bid, title, title, "2026-10-20", "0101-01-01", 1.0, author, rel, f"uuid-{bid}", 0, "2026-10-20"))
+    aid = db.execute("INSERT INTO authors VALUES (NULL,?,?, '')", (author, author)).lastrowid
+    db.execute("INSERT INTO books_authors_link VALUES (NULL,?,?)", (bid, aid))
+    status = "Added"
+rel = db.execute("SELECT path FROM books WHERE id=?", (bid,)).fetchone()[0]
+dest = root / rel
+dest.mkdir(parents=True, exist_ok=True)
+name = f"{title} - {author}"
+shutil.copyfile(src, dest / (name + src.suffix))
+db.execute("INSERT INTO data VALUES (NULL,?,?,?,?)", (bid, src.suffix[1:].upper(), src.stat().st_size, name))
+db.commit()
+print(f"{status} book ids: {bid}")
+''')
+    path.chmod(path.stat().st_mode | stat.S_IEXEC)
+    return path
+
+
+class AddBookTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        make_library(self.root / "lib")
+        self.cfg = Config(libraries=[LibraryConfig("main", self.root / "lib")], cache_dir=self.root / "cache",
+                          convert=False, calibredb=str(fake_calibredb(self.root / "calibredb")))
+        self.app = build_app(self.cfg)
+
+    def test_add_and_duplicates(self):
+        with TestClient(self.app, base_url="http://books.test") as c:
+            self.assertTrue(c.get("/").json()["add_books"])
+            r = c.post("/main/books", files={"file": ("x.epub", b"book bytes")},
+                       data={"title": "New Book", "authors": "A & B", "tags": "one,two", "languages": "eng,zho",
+                             "series": "S", "series_index": "2.5", "identifier": "isbn:123"})
+            self.assertEqual(r.status_code, 201, r.text)
+            self.assertEqual(r.headers["location"], "http://books.test/main/books/4")
+            book = r.json()["books"][0]
+            self.assertEqual(book["title"], "New Book")
+            self.assertEqual(c.get(book["downloads"]["EPUB"]).content, b"book bytes")
+            self.assertEqual(self.app.state.catalog.library("main").search("New Book")[0], 1)
+            args = json.loads((self.root / "lib" / "last-args.json").read_text())
+            for flag, value in (("--authors", "A & B"), ("--tags", "one,two"), ("--languages", "eng,zho"),
+                                ("--series", "S"), ("--series-index", "2.5"), ("--identifier", "isbn:123")):
+                self.assertEqual(args[args.index(flag) + 1], value)
+            url = "/main/books?filename=x.epub&title=New%20Book&authors=A%20%26%20B"
+            r = c.post(url, content=b"again")
+            self.assertEqual(r.status_code, 409, r.text)
+            self.assertEqual([b["id"] for b in r.json()["existing"]], [4])
+            r = c.post(url + "&duplicates=new_record", content=b"again")
+            self.assertEqual(r.status_code, 201, r.text)
+            r = c.post(url.replace("x.epub", "x.mobi") + "&duplicates=merge", content=b"mobi")
+            self.assertEqual((r.status_code, r.json()["status"]), (200, "merged"))
+            self.assertEqual(c.post(url + "&duplicates=merge", content=b"again").status_code, 409)
+            self.assertEqual(list((self.cfg.cache_dir / "uploads").iterdir()), [])
+
+    def test_raw_metadata_and_errors(self):
+        with TestClient(self.app, base_url="http://books.test") as c:
+            r = c.post("/main/books?filename=raw.epub&title=Raw&authors=Writer&tags=a,b&identifier=isbn:9",
+                       content=b"raw", headers={"Content-Type": "application/x-www-form-urlencoded",
+                                                "Origin": "http://books.test"})
+            self.assertEqual(r.status_code, 201, r.text)
+            args = json.loads((self.root / "lib" / "last-args.json").read_text())
+            self.assertEqual(args[args.index("--title") + 1], "Raw")
+            calls = (self.root / "lib" / "last-args.json").read_bytes()
+            for query in ("duplicates=bad", "series_index=no", "title=", "identifier=bad"):
+                self.assertEqual(c.post("/main/books?filename=x.epub&" + query, content=b"x").status_code, 400)
+                self.assertEqual((self.root / "lib" / "last-args.json").read_bytes(), calls)
+            self.assertEqual(c.post("/nope/books", content=b"x").status_code, 404)
+            self.assertEqual(c.post("/main/books?filename=x.epub", content=b"x",
+                                    headers={"Origin": "https://foreign.test"}).status_code, 403)
+            self.assertEqual(c.post("/main/books?filename=forward.epub", content=b"x", headers={
+                "Origin": "https://proxy.test", "X-Forwarded-Host": "proxy.test"}).status_code, 201)
+            self.app.state.catalog.max_upload = 2
+            self.assertEqual(c.post("/main/books?filename=x.epub", content=b"123").status_code, 413)
+            self.assertEqual(list((self.cfg.cache_dir / "uploads").iterdir()), [])
+
+    def test_unavailable_and_check(self):
+        self.cfg.calibredb = str(self.root / "missing-calibredb")
+        with TestClient(build_app(self.cfg)) as c:
+            self.assertFalse(c.get("/").json()["add_books"])
+            r = c.post("/main/books", content=b"")
+            self.assertEqual(r.status_code, 503)
+            self.assertIn("calibredb is not installed", r.json()["error"])
+        from calibre_mcp.__main__ import main
+        out = io.StringIO()
+        with redirect_stdout(out):
+            main(["check", "-l", f"main={self.root / 'lib'}", "--calibredb", str(self.root / "calibredb"),
+                  "--max-upload-mb", "7"])
+        self.assertIn(f"add books: yes (calibredb: {self.root / 'calibredb'}; max upload: 7 MB)", out.getvalue())
+
+    def test_import_errors_and_missing_ids(self):
+        from calibre_mcp.importer import AddError, AddResult
+
+        with TestClient(self.app) as c:
+            for error in (AddError("library is locked", 503), AddError("calibredb timed out", 502),
+                          AddError("calibredb failed: stderr tail", 502)):
+                with patch.object(self.app.state.catalog.importer, "add", AsyncMock(side_effect=error)):
+                    r = c.post("/main/books?filename=x.epub", content=b"x")
+                    self.assertEqual((r.status_code, r.json()), (error.status, {"error": str(error)}))
+                    self.assertEqual(list((self.cfg.cache_dir / "uploads").iterdir()), [])
+            with patch.object(self.app.state.catalog.importer, "add",
+                              AsyncMock(return_value=AddResult("added", [999], []))):
+                self.assertEqual(c.post("/main/books?filename=x.epub", content=b"x").status_code, 502)
+            with patch.object(self.app.state.catalog.importer, "add",
+                              AsyncMock(return_value=AddResult("added", [999, 1], []))):
+                r = c.post("/main/books?filename=x.epub", content=b"x")
+                self.assertEqual(r.status_code, 201)
+                self.assertEqual([book["id"] for book in r.json()["books"]], [1])
+
+    def test_discovery_and_search_after_upload(self):
+        from mcp import Client
+        import httpx2
+        from mcp.client.streamable_http import streamable_http_client
+
+        async def run():
+            if not hasattr(httpx2, "ASGITransport"):
+                self.skipTest("httpx2 has no ASGITransport")
+            async with self.app.router.lifespan_context(self.app):
+                async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=self.app),
+                                              base_url="http://books.test") as http:
+                    async with Client(streamable_http_client("http://books.test/mcp", http_client=http)) as client:
+                        self.assertEqual({t.name for t in (await client.list_tools()).tools},
+                                         {"list_libraries", "search_books", "get_book", "browse_library"})
+                        res = await client.call_tool("list_libraries", {})
+                        libs = json.loads(" ".join(getattr(item, "text", "") for item in res.content))
+                        self.assertTrue(libs["add_books"])
+                        self.assertEqual(libs["libraries"][0]["add_url"], "http://books.test/main/books")
+                        r = await http.post(libs["libraries"][0]["add_url"] + "?filename=Discover.epub",
+                                            content=b"new book")
+                        self.assertEqual(r.status_code, 201)
+                        res = await client.call_tool("search_books", {"query": "Discover"})
+                        books = json.loads(" ".join(getattr(item, "text", "") for item in res.content))
+                        self.assertEqual([b["title"] for b in books["books"]], ["Discover"])
+                        self.app.state.catalog.importer._available = False
+                        res = await client.call_tool("list_libraries", {})
+                        libs = json.loads(" ".join(getattr(item, "text", "") for item in res.content))
+                        self.assertFalse(libs["add_books"])
+                        self.assertNotIn("add_url", libs["libraries"][0])
+
+        asyncio.run(run())
+
+    def test_allowed_origin_and_startup_sweep(self):
+        self.cfg.allowed_hosts = ["other.test"]
+        leftover = self.cfg.cache_dir / "uploads" / ".upload-old"
+        leftover.mkdir(parents=True)
+        (leftover / "x.epub").write_bytes(b"leftover")
+        app = build_app(self.cfg)
+        self.assertFalse(leftover.exists())
+        with TestClient(app) as c:
+            self.assertEqual(c.post("/main/books?filename=x.epub", content=b"x",
+                                    headers={"Origin": "https://other.test"}).status_code, 201)
 
 
 if __name__ == "__main__":
