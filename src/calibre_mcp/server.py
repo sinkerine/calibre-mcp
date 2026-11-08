@@ -8,17 +8,21 @@ HTTP (no auth; put it behind a proxy that limits who can reach it):
     GET /<library>/books/<id>/<format>         a book file, e.g. /main/books/1037/epub, /main/books/12/mobi
     GET /<library>/books/<id>/epub             the EPUB, converted on demand when the book has none
     GET /<library>/books/<id>/cover.jpg
-    POST /<library>/books                      upload and add a book via calibredb
+    PUT /uploads/<file_id>                     bytes for an upload started with MCP prepare_upload
     POST /mcp                                  MCP (streamable HTTP, stateless)
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import math
+import shlex
 import mimetypes
 import re
 import unicodedata
 from collections.abc import Mapping
+from contextlib import asynccontextmanager, suppress
 from typing import Literal
 from urllib.parse import quote, urlsplit
 
@@ -30,23 +34,27 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response
 
-from . import __version__, upload
+from . import __version__
 from .config import Config
 from .convert import ConvertError, Converter
-from .importer import AddError, Importer
+from .importer import AddError, BookMetadata, Importer
+from .staging import Stager, StagingError
 from .library import Library
 
 log = logging.getLogger("calibre_mcp")
 
 INSTRUCTIONS = """\
-Read-only tools for Calibre ebook libraries. Find books with search_books (words match title, authors, tags
+Tools for Calibre ebook libraries. Find books with search_books (words match title, authors, tags
 and series; filters narrow it), inspect one with get_book, and browse authors/tags/series with
 browse_library. Every book comes with direct HTTP download URLs for each stored format, an `epub_url`
 (converted on demand when the book has no EPUB; the first request can take a minute) and a cover URL.
 Book ids are per library; omit `library` to use the default one.
-To add a book, POST the file to the library's `add_url` (e.g. `curl -F file=@book.epub <add_url>`;
-optional fields title, authors, tags, series, series_index, languages, identifier=type:value,
-duplicates=refuse|new_record|merge)."""
+To add a book (when list_libraries reports add_books): call prepare_upload(filename), upload the file's
+bytes with the returned method to upload_url (`curl --fail-with-body -T ./book.epub '<upload_url>'`),
+then call add_book(file_id, …) with optional metadata overrides. A duplicate or an error keeps the upload
+until it expires, so retry add_book without uploading again; ask the user before using
+duplicates=new_record or merge."""
+WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False)
 READ = ToolAnnotations(read_only_hint=True, open_world_hint=False, idempotent_hint=True)
 MEDIA = {".epub": "application/epub+zip", ".mobi": "application/x-mobipocket-ebook",
          ".azw3": "application/vnd.amazon.ebook", ".azw": "application/vnd.amazon.ebook",
@@ -78,6 +86,25 @@ def same_origin(request: Request, allowed_hosts: list[str]) -> bool:
                 and (host == target.lower() or host in [h.lower() for h in allowed_hosts]))
 
 
+def tool_metadata(title: str | None, authors: list[str] | None, tags: list[str] | None,
+                  series: str | None, series_index: float | None, languages: list[str] | None,
+                  identifiers: dict[str, str] | None) -> BookMetadata:
+    normalized = {}
+    for key, value in (identifiers or {}).items():
+        key = key.strip().lower()
+        if key in normalized:
+            raise ToolError("identifier keys must be unique when lowercased")
+        normalized[key] = value
+    if series_index is not None and not math.isfinite(series_index):
+        raise ToolError("series_index must be finite")
+    metadata = BookMetadata(title, authors, tags, series, series_index, languages, normalized)
+    try:
+        metadata.args()
+    except AddError as exc:
+        raise ToolError(str(exc)) from None
+    return metadata
+
+
 class Catalog:
     """The configured libraries, the converter and URL building."""
 
@@ -86,8 +113,9 @@ class Catalog:
         self.libraries = {lib.name: Library(lib.name, lib.path) for lib in cfg.libraries}
         self.default = cfg.libraries[0].name
         self.importer = Importer(cfg.calibredb, timeout=cfg.add_timeout)
-        self.upload_root = cfg.cache_dir / "uploads"
         self.max_upload = cfg.max_upload_mb * 1024 * 1024
+        self.stager = Stager(cfg.cache_dir / "uploads", ttl=cfg.upload_ttl, max_bytes=self.max_upload,
+                             max_entries=cfg.max_staged_uploads)
         log.info("adding books %s (calibredb: %s)", "enabled" if self.can_add else "disabled", cfg.calibredb)
         self.converter = Converter(cfg.ebook_convert, cfg.cache_dir, timeout=cfg.convert_timeout)
         if cfg.convert and not self.converter.available:
@@ -132,7 +160,7 @@ class Catalog:
 def build_app(cfg: Config) -> Starlette:
     cfg.validate()
     cat = Catalog(cfg)
-    upload.sweep(cat.upload_root)
+    cat.stager.sweep()
     mcp = MCPServer("calibre-mcp", instructions=INSTRUCTIONS, version=__version__)
 
     def lib_or_error(name: str | None) -> Library:
@@ -146,10 +174,8 @@ def build_app(cfg: Config) -> Starlette:
     @mcp.tool(annotations=READ)
     def list_libraries(ctx: Context) -> dict:
         """The Calibre libraries served here, with book counts and stored formats."""
-        base = cat.base_url(ctx.headers)
         return {"default": cat.default, "convert_to_epub": cat.can_convert, "add_books": cat.can_add,
-                "libraries": [{"name": lib.name, "books": lib.count(), "formats": lib.formats(),
-                               **({"add_url": f"{base}/{lib.name}/books"} if cat.can_add else {})}
+                "libraries": [{"name": lib.name, "books": lib.count(), "formats": lib.formats()}
                               for lib in cat.libraries.values()]}
 
     @mcp.tool(annotations=READ)
@@ -187,6 +213,74 @@ def build_app(cfg: Config) -> Starlette:
         lib = lib_or_error(library)
         return {"library": lib.name, "kind": kind, "items": lib.browse(kind, filter, limit)}
 
+    @mcp.tool(annotations=WRITE)
+    async def prepare_upload(filename: str, ctx: Context) -> dict:
+        """Start adding a book: PUT bytes to upload_url, then call add_book with file_id.
+        The filename extension picks the format. One file per call; expires after inactivity.
+        """
+        if not cat.can_add:
+            raise ToolError("calibredb is not installed; adding books needs Calibre")
+        try:
+            staged = cat.stager.prepare(filename)
+        except StagingError as exc:
+            raise ToolError(str(exc)) from None
+        url = f"{cat.base_url(ctx.headers)}/uploads/{staged.file_id}"
+        log.info("staged %s (%s)", staged.file_id[:6], staged.filename)
+        return {"file_id": staged.file_id, "upload_url": url, "method": "PUT", "filename": staged.filename,
+                "max_bytes": cat.max_upload, "expires_at": cat.stager.expires_at(staged),
+                "expires_in": cat.stager.expires_in(staged),
+                "curl": f"curl --fail-with-body -T <local file> {shlex.quote(url)}"}
+
+    @mcp.tool(annotations=WRITE)
+    async def add_book(file_id: str, ctx: Context, library: str | None = None,
+                       title: str | None = None, authors: list[str] | None = None, tags: list[str] | None = None,
+                       series: str | None = None, series_index: float | None = None,
+                       languages: list[str] | None = None, identifiers: dict[str, str] | None = None,
+                       duplicates: Literal["refuse", "new_record", "merge"] = "refuse") -> dict:
+        """Import a file uploaded via prepare_upload. Metadata overrides the ebook's own.
+        duplicates: refuse returns status duplicate and keeps the upload; new_record creates another
+        record; merge adds a missing format. Errors keep the upload until expiry for a corrected retry.
+        """
+        if not cat.can_add:
+            raise ToolError("calibredb is not installed; adding books needs Calibre")
+        lib = lib_or_error(library)
+        metadata = tool_metadata(title, authors, tags, series, series_index, languages, identifiers)
+        try:
+            staged = cat.stager.claim(file_id)
+        except StagingError as exc:
+            raise ToolError(str(exc)) from None
+        try:
+            result = await cat.importer.add(lib.root, staged.path, metadata, duplicates)
+        except AddError as exc:
+            cat.stager.release(file_id)
+            raise ToolError(str(exc)) from None
+        except BaseException:
+            cat.stager.release(file_id)
+            raise
+        if result.status != "duplicate":
+            cat.stager.consume(file_id)
+            log.info("consumed %s", file_id[:6])
+            books = []
+            for bid in result.book_ids:
+                book = lib.book(bid)
+                if book is not None:
+                    books.append(book | cat.links(lib, book, cat.base_url(ctx.headers)))
+            if not books:
+                raise ToolError("calibredb reported no readable books")
+            return {"status": result.status, "library": lib.name, "file_id": file_id, "books": books}
+        cat.stager.release(file_id)
+        existing = {}
+        for duplicate_title in result.duplicate_titles:
+            _, books = lib.search(duplicate_title, limit=10)
+            for book in books:
+                if len(existing) < 10:
+                    existing[book["id"]] = book | cat.links(lib, book, cat.base_url(ctx.headers))
+        return {"status": "duplicate", "library": lib.name, "file_id": file_id,
+                "message": "already in the library: " + "; ".join(result.duplicate_titles)
+                + '; the upload is kept — call add_book again with duplicates="new_record" or "merge" '
+                'if the user wants that', "existing": list(existing.values()),
+                "expires_at": cat.stager.expires_at(staged)}
+
     # -- HTTP -------------------------------------------------------------------------
 
     def not_found(msg: str = "not found") -> Response:
@@ -202,45 +296,21 @@ def build_app(cfg: Config) -> Starlette:
         return JSONResponse({"service": "calibre-mcp", "version": __version__, "mcp": "/mcp",
                              "libraries": {n: f"/{n}/books/<id>" for n in cat.libraries},
                              "convert_to_epub": cat.can_convert, "add_books": cat.can_add,
-                             "add": "POST /<library>/books"})
+                             "upload": "MCP prepare_upload, then PUT /uploads/<file_id>, then MCP add_book"})
 
-    @mcp.custom_route("/{library}/books", methods=["POST"])
-    async def add_book(request: Request) -> Response:
-        """Upload a book file and add it with calibredb."""
+    @mcp.custom_route("/uploads/{file_id}", methods=["PUT"])
+    async def put_upload(request: Request) -> Response:
         if not same_origin(request, cfg.allowed_hosts):
             return JSONResponse({"error": "cross-origin upload refused"}, status_code=403)
-        lib = cat.libraries.get(request.path_params["library"])
-        if lib is None:
-            return not_found("no such library")
         if not cat.can_add:
             return JSONResponse({"error": "calibredb is not installed; adding books needs Calibre"}, status_code=503)
         try:
-            async with upload.receive(request, cat.upload_root, cat.max_upload) as up:
-                result = await cat.importer.add(lib.root, up.path, up.metadata, up.duplicates)
-        except (upload.UploadError, AddError) as exc:
+            staged = await cat.stager.receive(request.path_params["file_id"], request, cat.max_upload)
+        except StagingError as exc:
             return JSONResponse({"error": str(exc)}, status_code=exc.status)
-        base = cat.base_url(request.headers)
-        if result.status == "duplicate":
-            existing = {}
-            for title in result.duplicate_titles:
-                _, books = lib.search(title, limit=10)
-                for book in books:
-                    if len(existing) < 10:
-                        existing[book["id"]] = book | cat.links(lib, book, base)
-            return JSONResponse({"status": "duplicate", "library": lib.name,
-                                 "message": "already in the library: " + "; ".join(result.duplicate_titles)
-                                 + "; send duplicates=new_record or duplicates=merge",
-                                 "existing": list(existing.values())}, status_code=409)
-        books = []
-        for bid in result.book_ids:
-            book = lib.book(bid)
-            if book is not None:
-                books.append(book | cat.links(lib, book, base))
-        if not books:
-            return JSONResponse({"error": "calibredb reported no readable books"}, status_code=502)
-        return JSONResponse({"status": result.status, "library": lib.name, "books": books},
-                            status_code=201 if result.status == "added" else 200,
-                            headers={"Location": f"{base}/{lib.name}/books/{books[0]['id']}"})
+        log.info("received %s (%s bytes)", staged.file_id[:6], staged.size)
+        return JSONResponse({"file_id": staged.file_id, "filename": staged.filename, "size": staged.size,
+                             "sha256": staged.sha256, "expires_at": cat.stager.expires_at(staged)})
 
     @mcp.custom_route("/health", methods=["GET"])
     async def health(request: Request) -> Response:
@@ -299,6 +369,29 @@ def build_app(cfg: Config) -> Starlette:
                                                           for p in ("http", "https")])
     app = mcp.streamable_http_app(streamable_http_path="/mcp", stateless_http=True, json_response=True,
                                   transport_security=security, host=cfg.host)
+    original_lifespan = app.router.lifespan_context
+
+    async def reaper():
+        while True:
+            await asyncio.sleep(min(60, cfg.upload_ttl))
+            try:
+                count = cat.stager.reap()
+                log.debug("reaped %s uploads", count)
+            except Exception:
+                log.exception("upload reaper failed")
+
+    @asynccontextmanager
+    async def lifespan(app):
+        async with original_lifespan(app):
+            task = asyncio.create_task(reaper())
+            try:
+                yield
+            finally:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+
+    app.router.lifespan_context = lifespan
     app.state.catalog = cat
     return app
 

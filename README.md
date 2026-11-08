@@ -5,7 +5,7 @@ every book file. Reads use `metadata.db` read-only; adds go through Calibre’s 
 
 - **MCP tools** (streamable HTTP at `/mcp`, stateless):
   `list_libraries`, `search_books`, `get_book`, `browse_library` (authors / tags / series / publishers /
-  languages). Every book comes with direct download URLs per stored format, an `epub_url` and a `cover_url`.
+  languages), plus `prepare_upload` and `add_book` for imports. Every book comes with direct download URLs per stored format, an `epub_url` and a `cover_url`.
 - **Direct links**, usable by anything that speaks HTTP:
 
   | URL | |
@@ -36,7 +36,9 @@ convert_timeout = 900
 allowed_hosts = []           # Host headers /mcp accepts; empty = any
 calibredb = "calibredb"       # executable for adding books
 add_timeout = 300            # seconds
-max_upload_mb = 1024         # maximum request size in MiB, including multipart overhead
+max_upload_mb = 1024         # maximum PUT body size in MiB
+upload_ttl = 3600           # inactivity timeout, seconds (minimum 60)
+max_staged_uploads = 16     # maximum live staged files (minimum 1)
 
 [[libraries]]                # the first one is the default
 name = "main"
@@ -53,7 +55,9 @@ path = "/books"              # directory that holds metadata.db
 | `CALIBRE_MCP_EBOOK_CONVERT` | path to `ebook-convert` |
 | `CALIBRE_MCP_ALLOWED_HOSTS` | comma-separated |
 | `CALIBRE_MCP_CALIBREDB` | path to `calibredb` (`--calibredb PATH`) |
-| `CALIBRE_MCP_MAX_UPLOAD_MB` | maximum request size in MiB (`--max-upload-mb N`) |
+| `CALIBRE_MCP_MAX_UPLOAD_MB` | maximum PUT body size in MiB (`--max-upload-mb N`) |
+| `CALIBRE_MCP_UPLOAD_TTL` | inactivity timeout in seconds (`--upload-ttl N`) |
+| `CALIBRE_MCP_MAX_STAGED_UPLOADS` | maximum live staged files (`--max-staged-uploads N`) |
 
 ```sh
 calibre-mcp check -l main=/srv/calibre          # print libraries and recent books
@@ -62,38 +66,54 @@ calibre-mcp -l main=/srv/calibre --port 8000     # serve
 
 ## Adding books
 
-Upload to `POST /<library>/books`. This requires `calibredb` on PATH (or configured with `calibredb`)
-and a **read-write** library mount. `list_libraries` advertises `add_books` and each library's `add_url`;
-`calibre-mcp check` also reports whether adding is available. The four MCP tools remain read-only.
+Add books in three steps using an MCP client and a shell:
 
-```sh
-curl -i -F file=@book.epub -F title='A new book' -F 'authors=A & B' \
-  -F tags=fiction,favourites http://localhost:8000/main/books
-curl -i --data-binary @book.epub \
-  'http://localhost:8000/main/books?filename=book.epub&title=A%20new%20book'
-```
+1. Call MCP `prepare_upload(filename="book.epub")`. It returns `file_id`, `upload_url`, `method: "PUT"`,
+   sanitized `filename`, `max_bytes`, `expires_at`, `expires_in` and a curl hint.
+2. Upload the file bytes from the machine that holds the file:
 
-Multipart uses a `file` part; an optional `filename` field overrides its filename. Raw bodies require
-`?filename=` or a `Content-Disposition: attachment; filename="book.epub"` header. Filenames must include
-an extension. Metadata fields are `title`, `authors` (split on `&`, or repeated), `tags` and `languages`
-(comma-separated, or repeated), `series`, `series_index` (number, requires series), and repeated
-`identifier=type:value` (for example `identifier=isbn:9780684800011`). Use form fields for multipart
-and query parameters for raw bodies.
+   ```sh
+   curl --fail-with-body -T ./book.epub '<upload_url>'
+   ```
 
-`duplicates=refuse` is the default: duplicates return **409** with matching books in `existing`.
-`duplicates=new_record` creates another record. `duplicates=merge` merges into an existing book and
-returns **200**, or **409** if that format already exists. A new book returns **201** with metadata,
-download links and a `Location` header. Invalid input returns **400**, unknown libraries **404**,
-oversized requests **413**, unavailable calibredb or a locked library **503**, and failed or timed-out
-imports **502**. Error bodies contain `error`; duplicate responses contain `status`, `message` and `existing`.
+3. Call MCP `add_book(file_id="<file_id>", title="A new book", authors=["A", "B"], tags=["fiction"])`.
+   Omit `library` to use the first configured library. The result has `status: "added"` or `"merged"`,
+   `library`, `file_id` and `books` with metadata and download links. Success consumes the staged upload.
 
-`max_upload_mb` defaults to 1024 MiB and caps the entire body, including multipart overhead.
-Temporary uploads live under `<cache_dir>/uploads` and are removed after requests; crash leftovers are
-swept on startup. `add_timeout` sets the calibredb timeout in seconds (default 300).
+The four discovery tools remain read-only; the two new tools change server state. `list_libraries` reports
+`add_books`; `calibre-mcp check` also reports whether adding is available. Imports require `calibredb`
+on PATH (or configured with `calibredb`), a writable cache and a **read-write** library mount.
+Bytes travel over HTTP, never through MCP. No server paths or import mounts are needed.
 
-There is no auth: restrict POST at your proxy if needed. Browser requests with a foreign `Origin` are
-refused with **403**; the origin host must match the request host or an entry in `allowed_hosts`.
-Do not add while the Calibre desktop app has the same library open.
+Metadata parameters are flat: `title` (non-empty string), `authors`, `tags`, `languages` (lists of strings),
+`series` (string), `series_index` (finite number requiring series), and `identifiers` (a dictionary such as
+`{"isbn": "9780684800011"}`). Identifier keys are case-insensitive and must be unique; keys allow letters,
+digits, `_` and `-`. Values must be non-empty and cannot contain commas. Unspecified metadata comes from
+the ebook. The filename needs a stem and extension; its extension selects the format.
+
+`duplicates="refuse"` is the default. A duplicate is a normal MCP result with `status: "duplicate"`,
+`message`, matching books in `existing`, and `expires_at`. The upload stays available: retry `add_book`
+with the same `file_id` without uploading again. Ask the user before using `duplicates="new_record"`
+(to create another record) or `duplicates="merge"` (to add a missing format). Merge keeps existing
+formats and reports a duplicate if the format is already present. Calibre may match multiple records.
+
+Invalid metadata, unknown libraries and import failures are MCP tool errors and keep the upload for a
+corrected retry. An import that changed the library but returned no readable books consumes the upload.
+`add_timeout` sets the calibredb timeout in seconds (default 300).
+
+PUT returns HTTP **200** with `file_id`, `filename`, `size`, `sha256` and `expires_at`. A second PUT replaces
+the staged bytes. Errors return JSON `error`: **400** for an empty or malformed body, **403** for a foreign
+browser Origin, **404** for an unknown or expired id, **409** while uploading/importing, **413** for a body
+above `max_upload_mb` (default 1024 MiB), and **503** when calibredb is unavailable. The browser Origin
+must match the request host or an entry in `allowed_hosts`.
+
+Staged files live under `<cache_dir>/uploads`. `upload_ttl` defaults to 3600 seconds of inactivity,
+refreshed by a successful PUT or a failed import. `max_staged_uploads` defaults to 16; worst-case staging
+disk use is that cap times `max_upload_mb`. Expired uploads are removed lazily and by a background reaper.
+The registry lives in one process on one event loop; run a single uvicorn worker. Restarting drops all
+staged uploads, and startup removes crash leftovers. Keep upload URLs and file ids private: they are
+capabilities. The service has no authentication; restrict access at your proxy. Do not add while the
+Calibre desktop app has the same library open.
 
 ## Docker
 

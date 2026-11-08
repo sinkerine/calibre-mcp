@@ -17,7 +17,6 @@
         mcp
         starlette
         uvicorn
-        python-multipart
       ];
     in
     {

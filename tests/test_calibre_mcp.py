@@ -145,12 +145,11 @@ class CalibreMcpTest(unittest.TestCase):
                 http = httpx2.AsyncClient(transport=transport, base_url="http://calibre.test")
                 async with Client(streamable_http_client("http://calibre.test/mcp", http_client=http)) as client:
                     names = {t.name for t in (await client.list_tools()).tools}
-                    self.assertEqual(names, {"list_libraries", "search_books", "get_book", "browse_library"})
+                    self.assertEqual(names, {"list_libraries", "search_books", "get_book", "browse_library", "prepare_upload", "add_book"})
                     libs = await call(client, "list_libraries")
                     self.assertEqual(libs["libraries"][0]["books"], 3)
                     self.assertEqual(libs["add_books"], self.app.state.catalog.can_add)
-                    if libs["add_books"]:
-                        self.assertEqual(libs["libraries"][0]["add_url"], "http://calibre.test/main/books")
+                    self.assertNotIn("add_url", libs["libraries"][0])
                     res = await call(client, "search_books", query="cooking")
                     self.assertEqual([b["id"] for b in res["books"]], [1, 2])  # title hit first, tag hit second
                     self.assertEqual(res["books"][0]["epub_url"], "http://calibre.test/main/books/1/epub")
@@ -232,149 +231,223 @@ class AddBookTest(unittest.TestCase):
                           convert=False, calibredb=str(fake_calibredb(self.root / "calibredb")))
         self.app = build_app(self.cfg)
 
-    def test_add_and_duplicates(self):
-        with TestClient(self.app, base_url="http://books.test") as c:
-            self.assertTrue(c.get("/").json()["add_books"])
-            r = c.post("/main/books", files={"file": ("x.epub", b"book bytes")},
-                       data={"title": "New Book", "authors": "A & B", "tags": "one,two", "languages": "eng,zho",
-                             "series": "S", "series_index": "2.5", "identifier": "isbn:123"})
-            self.assertEqual(r.status_code, 201, r.text)
-            self.assertEqual(r.headers["location"], "http://books.test/main/books/4")
-            book = r.json()["books"][0]
-            self.assertEqual(book["title"], "New Book")
-            self.assertEqual(c.get(book["downloads"]["EPUB"]).content, b"book bytes")
-            self.assertEqual(self.app.state.catalog.library("main").search("New Book")[0], 1)
-            args = json.loads((self.root / "lib" / "last-args.json").read_text())
-            for flag, value in (("--authors", "A & B"), ("--tags", "one,two"), ("--languages", "eng,zho"),
-                                ("--series", "S"), ("--series-index", "2.5"), ("--identifier", "isbn:123")):
-                self.assertEqual(args[args.index(flag) + 1], value)
-            url = "/main/books?filename=x.epub&title=New%20Book&authors=A%20%26%20B"
-            r = c.post(url, content=b"again")
-            self.assertEqual(r.status_code, 409, r.text)
-            self.assertEqual([b["id"] for b in r.json()["existing"]], [4])
-            r = c.post(url + "&duplicates=new_record", content=b"again")
-            self.assertEqual(r.status_code, 201, r.text)
-            r = c.post(url.replace("x.epub", "x.mobi") + "&duplicates=merge", content=b"mobi")
-            self.assertEqual((r.status_code, r.json()["status"]), (200, "merged"))
-            self.assertEqual(c.post(url + "&duplicates=merge", content=b"again").status_code, 409)
-            self.assertEqual(list((self.cfg.cache_dir / "uploads").iterdir()), [])
-
-    def test_raw_metadata_and_errors(self):
-        with TestClient(self.app, base_url="http://books.test") as c:
-            r = c.post("/main/books?filename=raw.epub&title=Raw&authors=Writer&tags=a,b&identifier=isbn:9",
-                       content=b"raw", headers={"Content-Type": "application/x-www-form-urlencoded",
-                                                "Origin": "http://books.test"})
-            self.assertEqual(r.status_code, 201, r.text)
-            args = json.loads((self.root / "lib" / "last-args.json").read_text())
-            self.assertEqual(args[args.index("--title") + 1], "Raw")
-            calls = (self.root / "lib" / "last-args.json").read_bytes()
-            for query in ("duplicates=bad", "series_index=no", "title=", "identifier=bad"):
-                self.assertEqual(c.post("/main/books?filename=x.epub&" + query, content=b"x").status_code, 400)
-                self.assertEqual((self.root / "lib" / "last-args.json").read_bytes(), calls)
-            self.assertEqual(c.post("/nope/books", content=b"x").status_code, 404)
-            self.assertEqual(c.post("/main/books?filename=x.epub", content=b"x",
-                                    headers={"Origin": "https://foreign.test"}).status_code, 403)
-            self.assertEqual(c.post("/main/books?filename=forward.epub", content=b"x", headers={
-                "Origin": "https://proxy.test", "X-Forwarded-Host": "proxy.test"}).status_code, 201)
-            self.app.state.catalog.max_upload = 2
-            self.assertEqual(c.post("/main/books?filename=x.epub", content=b"123").status_code, 413)
-            self.assertEqual(list((self.cfg.cache_dir / "uploads").iterdir()), [])
-
-    def test_unavailable_and_check(self):
-        self.cfg.calibredb = str(self.root / "missing-calibredb")
-        with TestClient(build_app(self.cfg)) as c:
-            self.assertFalse(c.get("/").json()["add_books"])
-            r = c.post("/main/books", content=b"")
-            self.assertEqual(r.status_code, 503)
-            self.assertIn("calibredb is not installed", r.json()["error"])
-        from calibre_mcp.__main__ import main
-        out = io.StringIO()
-        with redirect_stdout(out):
-            main(["check", "-l", f"main={self.root / 'lib'}", "--calibredb", str(self.root / "calibredb"),
-                  "--max-upload-mb", "7"])
-        self.assertIn(f"add books: yes (calibredb: {self.root / 'calibredb'}; max upload: 7 MB)", out.getvalue())
-
-    def test_import_errors_and_missing_ids(self):
-        from calibre_mcp.importer import AddError, AddResult
-
-        with TestClient(self.app) as c:
-            for error in (AddError("library is locked", 503), AddError("calibredb timed out", 502),
-                          AddError("calibredb failed: stderr tail", 502)):
-                with patch.object(self.app.state.catalog.importer, "add", AsyncMock(side_effect=error)):
-                    r = c.post("/main/books?filename=x.epub", content=b"x")
-                    self.assertEqual((r.status_code, r.json()), (error.status, {"error": str(error)}))
-                    self.assertEqual(list((self.cfg.cache_dir / "uploads").iterdir()), [])
-            with patch.object(self.app.state.catalog.importer, "add",
-                              AsyncMock(return_value=AddResult("added", [999], []))):
-                self.assertEqual(c.post("/main/books?filename=x.epub", content=b"x").status_code, 502)
-            with patch.object(self.app.state.catalog.importer, "add",
-                              AsyncMock(return_value=AddResult("added", [999, 1], []))):
-                r = c.post("/main/books?filename=x.epub", content=b"x")
-                self.assertEqual(r.status_code, 201)
-                self.assertEqual([book["id"] for book in r.json()["books"]], [1])
-
-    def test_unrecognized_import_output_retains_stderr_diagnostic(self):
-        proc = subprocess.CompletedProcess("calibredb", 0, stdout="", stderr=(
-            "omit\na\nb\nc\nd\nreader failed: useful diagnostic\n"))
-        with TestClient(self.app) as c, patch("calibre_mcp.importer.subprocess.run", return_value=proc):
-            r = c.post("/main/books?filename=x.epub", content=b"x")
-        self.assertEqual(r.status_code, 502)
-        self.assertEqual(r.json(), {"error":
-                         "calibredb added nothing: a | b | c | d | reader failed: useful diagnostic"})
-        self.assertEqual(list((self.cfg.cache_dir / "uploads").iterdir()), [])
-
-    def test_import_timeout_retains_stderr_diagnostic(self):
-        timeout = subprocess.TimeoutExpired("calibredb", self.cfg.add_timeout, output=b"ignored stdout", stderr=(
-            b"omit\na\nb\nc\nd\nreader stalled: useful diagnostic \xff\n"))
-        with TestClient(self.app) as c, patch("calibre_mcp.importer.subprocess.run", side_effect=timeout):
-            r = c.post("/main/books?filename=x.epub", content=b"x")
-        self.assertEqual(r.status_code, 502)
-        self.assertEqual(r.json(), {"error": f"calibredb timed out after {self.cfg.add_timeout}s: "
-                         "a | b | c | d | reader stalled: useful diagnostic \ufffd"})
-        self.assertEqual(list((self.cfg.cache_dir / "uploads").iterdir()), [])
-
-    def test_discovery_and_search_after_upload(self):
+    def run_mcp(self, scenario):
         from mcp import Client
         import httpx2
         from mcp.client.streamable_http import streamable_http_client
 
         async def run():
-            if not hasattr(httpx2, "ASGITransport"):
-                self.skipTest("httpx2 has no ASGITransport")
             async with self.app.router.lifespan_context(self.app):
                 async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=self.app),
                                               base_url="http://books.test") as http:
                     async with Client(streamable_http_client("http://books.test/mcp", http_client=http)) as client:
-                        self.assertEqual({t.name for t in (await client.list_tools()).tools},
-                                         {"list_libraries", "search_books", "get_book", "browse_library"})
-                        res = await client.call_tool("list_libraries", {})
-                        libs = json.loads(" ".join(getattr(item, "text", "") for item in res.content))
-                        self.assertTrue(libs["add_books"])
-                        self.assertEqual(libs["libraries"][0]["add_url"], "http://books.test/main/books")
-                        r = await http.post(libs["libraries"][0]["add_url"] + "?filename=Discover.epub",
-                                            content=b"new book")
-                        self.assertEqual(r.status_code, 201)
-                        res = await client.call_tool("search_books", {"query": "Discover"})
-                        books = json.loads(" ".join(getattr(item, "text", "") for item in res.content))
-                        self.assertEqual([b["title"] for b in books["books"]], ["Discover"])
-                        self.app.state.catalog.importer._available = False
-                        res = await client.call_tool("list_libraries", {})
-                        libs = json.loads(" ".join(getattr(item, "text", "") for item in res.content))
-                        self.assertFalse(libs["add_books"])
-                        self.assertNotIn("add_url", libs["libraries"][0])
-
+                        await scenario(client, http)
         asyncio.run(run())
 
-    def test_allowed_origin_and_startup_sweep(self):
-        self.cfg.allowed_hosts = ["other.test"]
-        leftover = self.cfg.cache_dir / "uploads" / ".upload-old"
-        leftover.mkdir(parents=True)
-        (leftover / "x.epub").write_bytes(b"leftover")
-        app = build_app(self.cfg)
-        self.assertFalse(leftover.exists())
-        with TestClient(app) as c:
-            self.assertEqual(c.post("/main/books?filename=x.epub", content=b"x",
-                                    headers={"Origin": "https://other.test"}).status_code, 201)
+    async def call(self, client, name, error=None, **args):
+        result = await client.call_tool(name, args)
+        text = " ".join(getattr(item, "text", "") for item in result.content)
+        if error is not None:
+            self.assertTrue(result.is_error, text)
+            self.assertIn(error, text)
+            return text
+        self.assertFalse(result.is_error, text)
+        return json.loads(text)
+
+    async def stage(self, client, http, name="x.epub", body=b"book bytes"):
+        up = await self.call(client, "prepare_upload", filename=name)
+        response = await http.put(up["upload_url"], content=body)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["size"], len(body))
+        return up
+
+    def test_add_and_duplicates(self):
+        async def run(client, http):
+            tools = (await client.list_tools()).tools
+            self.assertEqual({t.name for t in tools}, {"list_libraries", "search_books", "get_book",
+                             "browse_library", "prepare_upload", "add_book"})
+            for tool in tools:
+                self.assertEqual(tool.annotations.read_only_hint, tool.name not in ("prepare_upload", "add_book"))
+            libs = await self.call(client, "list_libraries")
+            self.assertTrue(libs["add_books"])
+            self.assertNotIn("add_url", libs["libraries"][0])
+            up = await self.stage(client, http, "../My Book.epub")
+            self.assertEqual(up["filename"], "My Book.epub")
+            self.assertEqual(up["method"], "PUT")
+            self.assertTrue(up["expires_at"].endswith("Z"))
+            self.assertIn("curl --fail-with-body -T", up["curl"])
+            metadata = dict(title="New Book", authors=["A", "B"], tags=["one", "two"], languages=["eng", "zho"],
+                            series="S", series_index=2.5, identifiers={" ISBN ": "123"})
+            result = await self.call(client, "add_book", file_id=up["file_id"], **metadata)
+            self.assertEqual(result["status"], "added")
+            self.assertEqual((await http.get(result["books"][0]["downloads"]["EPUB"])).content, b"book bytes")
+            self.assertFalse((self.cfg.cache_dir / "uploads" / (".staged-" + up["file_id"])).exists())
+            await self.call(client, "add_book", error="unknown or expired file_id", file_id=up["file_id"])
+            self.assertEqual((await http.put(up["upload_url"], content=b"x")).status_code, 404)
+            args = json.loads((self.root / "lib" / "last-args.json").read_text())
+            for flag, value in (("--authors", "A & B"), ("--tags", "one,two"), ("--languages", "eng,zho"),
+                                ("--series", "S"), ("--series-index", "2.5"), ("--identifier", "isbn:123")):
+                self.assertEqual(args[args.index(flag) + 1], value)
+            up = await self.stage(client, http)
+            result = await self.call(client, "add_book", file_id=up["file_id"], **metadata)
+            self.assertEqual(result["status"], "duplicate")
+            self.assertEqual([b["id"] for b in result["existing"]], [4])
+            result = await self.call(client, "add_book", file_id=up["file_id"], duplicates="new_record", **metadata)
+            self.assertEqual(result["status"], "added")
+            up = await self.stage(client, http, "x.mobi")
+            self.assertEqual((await self.call(client, "add_book", file_id=up["file_id"], duplicates="merge",
+                                             **metadata))["status"], "merged")
+            up = await self.stage(client, http)
+            self.assertEqual((await self.call(client, "add_book", file_id=up["file_id"], duplicates="merge",
+                                             **metadata))["status"], "duplicate")
+            result = await self.call(client, "search_books", query="New Book")
+            self.assertEqual(result["total"], 2)
+        self.run_mcp(run)
+
+    def test_validation_and_http_guards(self):
+        async def run(client, http):
+            cat = self.app.state.catalog
+            await self.call(client, "prepare_upload", filename=".epub", error="non-empty stem")
+            self.assertEqual(len(cat.stager), 0)
+            up = await self.call(client, "prepare_upload", filename="x.epub")
+            await self.call(client, "add_book", file_id=up["file_id"], error="no bytes uploaded yet")
+            self.assertEqual((await http.put(up["upload_url"], content=b"x",
+                                            headers={"Origin": "https://foreign.test"})).status_code, 403)
+            self.assertEqual((await http.put(up["upload_url"], content=b"x", headers={
+                "Origin": "https://proxy.test", "X-Forwarded-Host": "proxy.test"})).status_code, 200)
+            for metadata, message in (({"title": " "}, "title must not be empty"),
+                    ({"series_index": 2}, "series_index needs series"),
+                    ({"identifiers": {"ISBN": "1", "isbn": "2"}}, "unique when lowercased"),
+                    ({"library": "missing"}, "no library"), ({"duplicates": "bad"}, "duplicates")):
+                await self.call(client, "add_book", file_id=up["file_id"], error=message, **metadata)
+            self.assertFalse((self.root / "lib" / "last-args.json").exists())
+            cat.max_upload = 2
+            self.assertEqual((await http.put(up["upload_url"], content=b"123")).status_code, 413)
+            self.assertEqual((await http.put(up["upload_url"], content=b"")).status_code, 400)
+            self.assertEqual((await http.get(up["upload_url"])).status_code, 405)
+            self.assertEqual((await http.put("/uploads/bad", content=b"x")).status_code, 404)
+            self.assertGreaterEqual((await http.post("/main/books", content=b"x")).status_code, 400)
+            self.assertIn("prepare_upload", (await http.get("/")).json()["upload"])
+            cat.stager.max_entries = 1
+            await self.call(client, "prepare_upload", filename="x.epub", error="too many pending uploads")
+            await self.call(client, "add_book", file_id=up["file_id"])
+            cat.importer._available = False
+            await self.call(client, "prepare_upload", filename="x.epub", error="calibredb is not installed")
+            await self.call(client, "add_book", file_id="x", error="calibredb is not installed")
+            self.assertEqual((await http.put(up["upload_url"], content=b"x")).status_code, 503)
+            self.assertFalse((await self.call(client, "list_libraries"))["add_books"])
+        self.run_mcp(run)
+
+    def test_import_errors_and_missing_ids(self):
+        from calibre_mcp.importer import AddError, AddResult
+
+        async def run(client, http):
+            cat = self.app.state.catalog
+            up = await self.stage(client, http)
+            for error in (AddError("library is locked", 503), AddError("calibredb timed out", 502),
+                          AddError("calibredb failed: stderr tail", 502)):
+                before = cat.stager._entries[up["file_id"]].expires
+                with patch.object(cat.importer, "add", AsyncMock(side_effect=error)):
+                    await self.call(client, "add_book", file_id=up["file_id"], error=str(error))
+                self.assertGreaterEqual(cat.stager._entries[up["file_id"]].expires, before)
+                self.assertTrue(cat.stager._entries[up["file_id"]].path.exists())
+            await self.call(client, "add_book", file_id=up["file_id"])
+            for ids in ([999], [999, 1]):
+                up = await self.stage(client, http)
+                with patch.object(cat.importer, "add", AsyncMock(return_value=AddResult("added", ids, []))):
+                    if ids == [999]:
+                        await self.call(client, "add_book", file_id=up["file_id"], error="no readable books")
+                    else:
+                        result = await self.call(client, "add_book", file_id=up["file_id"])
+                        self.assertEqual([b["id"] for b in result["books"]], [1])
+                self.assertNotIn(up["file_id"], cat.stager._entries)
+        self.run_mcp(run)
+
+    def test_import_diagnostics(self):
+        async def run(client, http):
+            up = await self.stage(client, http)
+            proc = subprocess.CompletedProcess("calibredb", 0, stdout="", stderr=(
+                "omit\na\nb\nc\nd\nreader failed: useful diagnostic\n"))
+            with patch("calibre_mcp.importer.subprocess.run", return_value=proc):
+                await self.call(client, "add_book", file_id=up["file_id"], error=
+                                "calibredb added nothing: a | b | c | d | reader failed: useful diagnostic")
+            timeout = subprocess.TimeoutExpired("calibredb", self.cfg.add_timeout, output=b"ignored", stderr=(
+                b"omit\na\nb\nc\nd\nreader stalled: useful diagnostic \xff\n"))
+            with patch("calibre_mcp.importer.subprocess.run", side_effect=timeout):
+                await self.call(client, "add_book", file_id=up["file_id"], error=
+                                f"calibredb timed out after {self.cfg.add_timeout}s: "
+                                "a | b | c | d | reader stalled: useful diagnostic \ufffd")
+            await self.call(client, "add_book", file_id=up["file_id"])
+        self.run_mcp(run)
+
+    def test_concurrency(self):
+        from calibre_mcp.importer import AddResult
+
+        async def run(client, http):
+            cat = self.app.state.catalog
+            up = await self.stage(client, http)
+            started, finish = asyncio.Event(), asyncio.Event()
+
+            async def slow(*args):
+                started.set()
+                await finish.wait()
+                return AddResult("added", [1], [])
+
+            with patch.object(cat.importer, "add", AsyncMock(side_effect=slow)) as importer:
+                first = asyncio.create_task(self.call(client, "add_book", file_id=up["file_id"]))
+                await started.wait()
+                await self.call(client, "add_book", file_id=up["file_id"], error="file_id is busy")
+                self.assertEqual((await http.put(up["upload_url"], content=b"x")).status_code, 409)
+                finish.set()
+                await first
+                self.assertEqual(importer.await_count, 1)
+        self.run_mcp(run)
+
+    def test_lifespan_reaper(self):
+        cat = self.app.state.catalog
+        staged = cat.stager.prepare("expired.epub")
+        staged.expires = cat.stager.clock() - 1
+        # Shorten only the sleep interval after build_app has validated the production limit.
+        self.cfg.upload_ttl = 0.01
+
+        async def run():
+            reaped = asyncio.Event()
+            original = cat.stager.reap
+
+            def reap():
+                count = original()
+                if count:
+                    reaped.set()
+                return count
+
+            with patch.object(cat.stager, "reap", side_effect=reap):
+                async with self.app.router.lifespan_context(self.app):
+                    await asyncio.wait_for(reaped.wait(), 2)
+            self.assertFalse(staged.dir.exists())
+            self.assertEqual(len(cat.stager), 0)
+        asyncio.run(run())
+
+    def test_allowed_origin_startup_sweep_and_check(self):
+        self.cfg.allowed_hosts = ["other.test", "books.test"]
+        for prefix in (".upload-", ".staged-"):
+            leftover = self.cfg.cache_dir / "uploads" / (prefix + "old")
+            leftover.mkdir(parents=True)
+            (leftover / "x.epub").write_bytes(b"leftover")
+        self.app = build_app(self.cfg)
+        self.assertEqual(list((self.cfg.cache_dir / "uploads").iterdir()), [])
+
+        async def run(client, http):
+            up = await self.call(client, "prepare_upload", filename="x.epub")
+            self.assertEqual((await http.put(up["upload_url"], content=b"x", headers={
+                "Origin": "https://other.test"})).status_code, 200)
+        self.run_mcp(run)
+        from calibre_mcp.__main__ import main
+        out = io.StringIO()
+        with redirect_stdout(out):
+            main(["check", "-l", f"main={self.root / 'lib'}", "--calibredb", str(self.root / "calibredb"),
+                  "--max-upload-mb", "7", "--upload-ttl", "120", "--max-staged-uploads", "3"])
+        self.assertIn(f"add books: yes (calibredb: {self.root / 'calibredb'}; max upload: 7 MB; "
+                      "upload ttl: 120 s; max staged: 3)", out.getvalue())
 
 
 if __name__ == "__main__":

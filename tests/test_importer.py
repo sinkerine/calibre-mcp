@@ -22,6 +22,7 @@ class ConfigTest(unittest.TestCase):
     def test_defaults(self) -> None:
         cfg = load_config(env={})
         self.assertEqual((cfg.calibredb, cfg.add_timeout, cfg.max_upload_mb), ("calibredb", 300, 1024))
+        self.assertEqual((cfg.upload_ttl, cfg.max_staged_uploads), (3600, 16))
 
     def test_toml_and_environment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -31,6 +32,27 @@ class ConfigTest(unittest.TestCase):
             self.assertEqual((cfg.calibredb, cfg.add_timeout, cfg.max_upload_mb), ("custom-db", 12, 64))
             cfg = load_config(config, env={"CALIBRE_MCP_CALIBREDB": "env-db", "CALIBRE_MCP_MAX_UPLOAD_MB": "32"})
             self.assertEqual((cfg.calibredb, cfg.add_timeout, cfg.max_upload_mb), ("env-db", 12, 32))
+
+    def test_staging_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "metadata.db").touch()
+            path = root / "config.toml"
+            path.write_text('upload_ttl = 120\nmax_staged_uploads = 3\n')
+            cfg = load_config(path, env={})
+            self.assertEqual((cfg.upload_ttl, cfg.max_staged_uploads), (120, 3))
+            cfg = load_config(path, env={"CALIBRE_MCP_UPLOAD_TTL": "60", "CALIBRE_MCP_MAX_STAGED_UPLOADS": "1"})
+            self.assertEqual((cfg.upload_ttl, cfg.max_staged_uploads), (60, 1))
+            cfg.libraries = [LibraryConfig("main", root)]
+            cfg.validate()
+            for key, values in (("upload_ttl", (59, 0, -1, 60.5, True)),
+                                ("max_staged_uploads", (0, -1, 1.5, True))):
+                old = getattr(cfg, key)
+                for value in values:
+                    setattr(cfg, key, value)
+                    with self.subTest(key=key, value=value), self.assertRaisesRegex(SystemExit, key):
+                        cfg.validate()
+                setattr(cfg, key, old)
 
     def test_path_maps_removed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

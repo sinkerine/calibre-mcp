@@ -10,7 +10,9 @@
     allowed_hosts = []         # Host headers /mcp accepts; empty = any (the proxy decides who gets in)
     calibredb = "calibredb"     # executable used to add books
     add_timeout = 300          # seconds
-    max_upload_mb = 1024       # maximum upload size in MiB
+    max_upload_mb = 1024       # maximum PUT body size in MiB
+    upload_ttl = 3600          # seconds of inactivity
+    max_staged_uploads = 16    # live staged files
 
     [[libraries]]              # one or more Calibre libraries (directories holding metadata.db)
     name = "main"
@@ -19,7 +21,8 @@
 Environment: CALIBRE_MCP_CONFIG (file), CALIBRE_MCP_LIBRARIES ("main=/books,other=/other"),
 CALIBRE_MCP_HOST, CALIBRE_MCP_PORT, CALIBRE_MCP_PUBLIC_URL, CALIBRE_MCP_CACHE_DIR,
 CALIBRE_MCP_CONVERT (0/1), CALIBRE_MCP_EBOOK_CONVERT, CALIBRE_MCP_ALLOWED_HOSTS (comma-separated),
-CALIBRE_MCP_CALIBREDB, CALIBRE_MCP_MAX_UPLOAD_MB (integer).
+CALIBRE_MCP_CALIBREDB, CALIBRE_MCP_MAX_UPLOAD_MB, CALIBRE_MCP_UPLOAD_TTL,
+CALIBRE_MCP_MAX_STAGED_UPLOADS (integers).
 """
 
 from __future__ import annotations
@@ -53,6 +56,8 @@ class Config:
     calibredb: str = "calibredb"
     add_timeout: int = 300
     max_upload_mb: int = 1024
+    upload_ttl: int = 3600
+    max_staged_uploads: int = 16
 
     def validate(self) -> None:
         if not self.libraries:
@@ -66,6 +71,10 @@ class Config:
             seen.add(lib.name)
             if not (lib.path / "metadata.db").is_file():
                 raise SystemExit(f"library {lib.name!r}: no metadata.db in {lib.path}")
+        if type(self.upload_ttl) is not int or self.upload_ttl < 60:
+            raise SystemExit("upload_ttl must be an integer of at least 60")
+        if type(self.max_staged_uploads) is not int or self.max_staged_uploads < 1:
+            raise SystemExit("max_staged_uploads must be an integer of at least 1")
         if self.max_upload_mb < 1:
             raise SystemExit("max_upload_mb must be at least 1")
         if self.add_timeout < 1:
@@ -106,6 +115,8 @@ def load_config(path: Path | None = None, env: dict[str, str] | None = None) -> 
         calibredb=str(raw.get("calibredb", "calibredb")),
         add_timeout=int(raw.get("add_timeout", 300)),
         max_upload_mb=int(raw.get("max_upload_mb", 1024)),
+        upload_ttl=raw.get("upload_ttl", 3600),
+        max_staged_uploads=raw.get("max_staged_uploads", 16),
     )
     if v := env.get("CALIBRE_MCP_LIBRARIES"):
         cfg.libraries = _libraries(v)
@@ -127,5 +138,8 @@ def load_config(path: Path | None = None, env: dict[str, str] | None = None) -> 
         cfg.calibredb = v
     if v := env.get("CALIBRE_MCP_MAX_UPLOAD_MB"):
         cfg.max_upload_mb = int(v)
+    for key in ("upload_ttl", "max_staged_uploads"):
+        if v := env.get("CALIBRE_MCP_" + key.upper()):
+            setattr(cfg, key, int(v))
     cfg.public_url = cfg.public_url.rstrip("/")
     return cfg
