@@ -1,9 +1,10 @@
-"""Import local files through Calibre's calibredb command."""
+"""Import files and update book metadata through Calibre's calibredb command."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import re
 import shutil
@@ -22,11 +23,12 @@ _DUPLICATE_HEADER = ("The following books were not added as they already exist i
 
 
 class AddError(RuntimeError):
-    """A user-facing reason the book was not added."""
+    """A user-facing write failure; changed marks an import that already changed the library."""
 
-    def __init__(self, message: str, status: int = 400) -> None:
+    def __init__(self, message: str, status: int = 400, *, changed: bool = False) -> None:
         super().__init__(message)
         self.status = status
+        self.changed = changed
 
 
 @dataclass(frozen=True)
@@ -38,8 +40,10 @@ class BookMetadata:
     series_index: float | None = None
     languages: list[str] | None = None
     identifiers: dict[str, str] | None = None
+    publisher: str | None = None
+    description: str | None = None
 
-    def args(self) -> list[str]:
+    def args(self, *, require_series: bool = True) -> list[str]:
         """Build calibredb options, rejecting ambiguous or empty values."""
         args = []
         if self.title is not None:
@@ -61,7 +65,9 @@ class BookMetadata:
         if series:
             args.extend(["--series", series])
         if self.series_index is not None:
-            if not series:
+            if not math.isfinite(self.series_index):
+                raise AddError("series_index must be finite")
+            if require_series and not series:
                 raise AddError("series_index needs series")
             args.extend(["--series-index", repr(float(self.series_index))])
         languages = [l.strip() for l in self.languages or [] if l.strip()]
@@ -77,6 +83,25 @@ class BookMetadata:
                 raise AddError("identifier values must not be empty or contain ','")
             args.extend(["--identifier", f"{key.lower()}:{value}"])
         return args
+
+    def fields(self) -> dict[str, str]:
+        """Only explicitly supplied fields, in calibredb set_metadata format."""
+        args = self.args(require_series=False)
+        fields = {}
+        for flag, value in zip(args[::2], args[1::2]):
+            name = flag[2:].replace("-", "_")
+            if name == "identifier":
+                fields["identifiers"] = ",".join(filter(None, (fields.get("identifiers"), value)))
+            else:
+                fields[name] = value
+        for name in ("authors", "tags", "series", "languages", "identifiers"):
+            if getattr(self, name) is not None:
+                fields.setdefault(name, "")
+        if self.publisher is not None:
+            fields["publisher"] = self.publisher.strip()
+        if self.description is not None:
+            fields["comments"] = self.description
+        return fields
 
 
 @dataclass
@@ -161,7 +186,31 @@ class Importer:
         async with lock:
             log.info("adding %s to %s", src.name, library_root)
             stdout, stderr = await asyncio.to_thread(self._run, cmd)
-        return parse_output(stdout, stderr)
+            result = parse_output(stdout, stderr)
+            extra = {k: v for k, v in metadata.fields().items() if k in ("publisher", "comments")}
+            if extra and result.book_ids:
+                try:
+                    for book_id in result.book_ids:
+                        await asyncio.to_thread(self._run, self.update_command(library_root, book_id, extra))
+                except AddError as exc:
+                    raise AddError(f"book ids {result.book_ids} imported, but metadata update failed: {exc}; "
+                                   "use update_book to retry", exc.status, changed=True) from exc
+        return result
+
+    def update_command(self, library_root: Path, book_id: int, fields: dict[str, str]) -> list[str]:
+        return [self.exe, "set_metadata", "--with-library", str(library_root),
+                *(arg for name, value in fields.items() for arg in ("--field", f"{name}:{value}")),
+                "--", str(book_id)]
+
+    async def update(self, library_root: Path, book_id: int, metadata: BookMetadata) -> None:
+        if not self.available:
+            raise AddError("calibredb is not installed; updating books needs Calibre", 503)
+        fields = metadata.fields()
+        if not fields:
+            raise AddError("provide at least one metadata field to update")
+        lock = self._locks.setdefault(str(library_root), asyncio.Lock())
+        async with lock:
+            await asyncio.to_thread(self._run, self.update_command(library_root, book_id, fields))
 
     def _run(self, cmd: list[str]) -> tuple[str, str]:
         with tempfile.TemporaryDirectory(prefix="calibre-mcp-add-") as tmp:

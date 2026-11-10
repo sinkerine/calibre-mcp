@@ -90,6 +90,21 @@ class BookMetadataTest(unittest.TestCase):
         self.assertEqual(BookMetadata(tags=[" "], languages=[""], series=" ").args(), [])
         self.assertEqual(BookMetadata(series="S", series_index=0).args(), ["--series", "S", "--series-index", "0.0"])
 
+    def test_update_fields(self) -> None:
+        meta = BookMetadata(title=" T ", authors=["A", "B"], tags=["x"], series="S", series_index=0,
+                            languages=["eng"], identifiers={"isbn": "123", "doi": "x:y"},
+                            publisher=" Pub ", description="<p>Text: here</p>")
+        self.assertEqual(meta.fields(), {"title": "T", "authors": "A & B", "tags": "x", "series": "S",
+            "series_index": "0.0", "languages": "eng", "identifiers": "doi:x:y,isbn:123",
+            "publisher": "Pub", "comments": "<p>Text: here</p>"})
+        self.assertEqual(BookMetadata().fields(), {})
+        self.assertEqual(BookMetadata(tags=[], identifiers={}, publisher="", description="").fields(),
+                         {"tags": "", "identifiers": "", "publisher": "", "comments": ""})
+        self.assertEqual(BookMetadata(series_index=2).fields(), {"series_index": "2.0"})
+        for index in (float("inf"), float("nan")):
+            with self.assertRaisesRegex(AddError, "finite"):
+                BookMetadata(series_index=index).fields()
+
     def test_invalid_fields(self) -> None:
         for meta in (BookMetadata(title=" "), BookMetadata(authors=[""]), BookMetadata(authors=["A & B"]),
                      BookMetadata(tags=["a,b"]), BookMetadata(languages=["eng,fra"]),
@@ -200,6 +215,31 @@ class ImporterTest(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(Path(record["home"]).exists())
                 self.assertIn("calibre-mcp-add-", record["home"])
 
+    async def test_update_command(self) -> None:
+        await self.importer.update(self.library, 4, BookMetadata(publisher="Pub", description="A: B"))
+        self.assertEqual(json.loads(self.record.read_text())["argv"],
+            ["set_metadata", "--with-library", str(self.library), "--field", "publisher:Pub",
+             "--field", "comments:A: B", "--", "4"])
+        with self.assertRaisesRegex(AddError, "at least one"):
+            await self.importer.update(self.library, 4, BookMetadata())
+
+    async def test_import_extra_metadata_and_partial_failure(self) -> None:
+        metadata = BookMetadata(publisher="Pub", description="Description")
+        with patch.object(self.importer, "_run", return_value=("Added book ids: 4", "")) as run:
+            await self.importer.add(self.library, self.book, metadata)
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_args.args[0], self.importer.update_command(
+            self.library, 4, {"publisher": "Pub", "comments": "Description"}))
+        with patch.object(self.importer, "_run", side_effect=[("Added book ids: 4", ""), AddError("failed")]):
+            with self.assertRaisesRegex(AddError, "use update_book to retry") as caught:
+                await self.importer.add(self.library, self.book, metadata)
+        self.assertTrue(caught.exception.changed)
+        with patch.object(self.importer, "_run", return_value=(
+                "The following books were not added as they already exist in the database\n  T", "")) as run:
+            result = await self.importer.add(self.library, self.book, metadata)
+        self.assertEqual(result.status, "duplicate")
+        self.assertEqual(run.call_count, 1)
+
     async def test_stderr_noise_does_not_change_result(self) -> None:
         self.control.write_text(json.dumps({"stderr": "Traceback: bad format\nMerged book ids: 99"}))
         result = await self.importer.add(self.library, self.book, BookMetadata())
@@ -305,7 +345,9 @@ class ImporterTest(unittest.IsolatedAsyncioTestCase):
             return "Added book ids: 4", ""
 
         with patch("calibre_mcp.importer.asyncio.to_thread", side_effect=run):
-            await asyncio.gather(*(self.importer.add(self.library, self.book, BookMetadata()) for _ in range(3)))
+            await asyncio.gather(self.importer.add(self.library, self.book, BookMetadata()),
+                                 self.importer.update(self.library, 4, BookMetadata(title="Updated")),
+                                 self.importer.add(self.library, self.book, BookMetadata()))
         self.assertEqual(calls, [str(self.library)] * 3)
 
 

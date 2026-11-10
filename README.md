@@ -1,11 +1,11 @@
 # calibre-mcp
 
 An MCP server over one or more [Calibre](https://calibre-ebook.com) libraries, plus plain HTTP links to
-every book file. Reads use `metadata.db` read-only; adds go through Calibre’s `calibredb`.
+every book file. Reads use `metadata.db` read-only; adds and metadata updates go through Calibre’s `calibredb`.
 
 - **MCP tools** (streamable HTTP at `/mcp`, stateless):
   `list_libraries`, `search_books`, `get_book`, `browse_library` (authors / tags / series / publishers /
-  languages), plus `prepare_upload` and `add_book` for imports. Every book comes with direct download URLs per stored format, an `epub_url` and a `cover_url`.
+  languages), plus `prepare_upload` and `add_book` for imports and `update_book` for metadata changes. Every book comes with direct download URLs per stored format, an `epub_url` and a `cover_url`.
 - **Direct links**, usable by anything that speaks HTTP:
 
   | URL | |
@@ -80,13 +80,14 @@ Add books in three steps using an MCP client and a shell:
    Omit `library` to use the first configured library. The result has `status: "added"` or `"merged"`,
    `library`, `file_id` and `books` with metadata and download links. Success consumes the staged upload.
 
-The four discovery tools remain read-only; the two new tools change server state. `list_libraries` reports
-`add_books`; `calibre-mcp check` also reports whether adding is available. Imports require `calibredb`
+The four discovery tools remain read-only; upload, add and update tools change server state. `list_libraries` reports
+`add_books` and `update_books`; `calibre-mcp check` also reports whether adding is available. Imports require `calibredb`
 on PATH (or configured with `calibredb`), a writable cache and a **read-write** library mount.
 Bytes travel over HTTP, never through MCP. No server paths or import mounts are needed.
 
 Metadata parameters are flat: `title` (non-empty string), `authors`, `tags`, `languages` (lists of strings),
-`series` (string), `series_index` (finite number requiring series), and `identifiers` (a dictionary such as
+`series` (series name), `series_index` (finite series number requiring series on import),
+`publisher` (string), `description` (text or HTML), and `identifiers` (a dictionary such as
 `{"isbn": "9780684800011"}`). Identifier keys are case-insensitive and must be unique; keys allow letters,
 digits, `_` and `-`. Values must be non-empty and cannot contain commas. Unspecified metadata comes from
 the ebook. The filename needs a stem and extension; its extension selects the format.
@@ -99,7 +100,10 @@ formats and reports a duplicate if the format is already present. Calibre may ma
 
 Invalid metadata, unknown libraries and import failures are MCP tool errors and keep the upload for a
 corrected retry. An import that changed the library but returned no readable books consumes the upload.
-`add_timeout` sets the calibredb timeout in seconds (default 300).
+Publisher and description overrides are applied with `calibredb set_metadata` after a successful import
+or merge. If that step fails, the error includes the imported book IDs and the upload is consumed;
+retry the metadata with `update_book`.
+`add_timeout` sets the timeout for each calibredb command in seconds (default 300).
 
 PUT returns HTTP **200** with `file_id`, `filename`, `size`, `sha256` and `expires_at`. A second PUT replaces
 the staged bytes. Errors return JSON `error`: **400** for an empty or malformed body, **403** for a foreign
@@ -114,6 +118,29 @@ The registry lives in one process on one event loop; run a single uvicorn worker
 staged uploads, and startup removes crash leftovers. Keep upload URLs and file ids private: they are
 capabilities. The service has no authentication; restrict access at your proxy. Do not add while the
 Calibre desktop app has the same library open.
+
+## Updating book metadata
+
+Call MCP `update_book` with a book ID and any metadata parameters supported by `add_book`:
+
+```json
+{
+  "book_id": 42,
+  "publisher": "Example Press",
+  "description": "<p>A revised description.</p>",
+  "series": "Example Series",
+  "series_index": 2.5
+}
+```
+
+The tool returns the book's full metadata and download links, like `get_book`. Omit `library` to use
+the default. Omitted or null fields stay unchanged; supplied lists and `identifiers` replace the
+existing values. Empty lists/dictionaries clear those fields (Calibre uses Unknown for empty authors);
+empty `series`, `publisher`, or `description` clears that field. `title` must remain non-empty.
+`series_index` can be updated alone for a book that already belongs to a series.
+At least one metadata field is required. Updates change library metadata; they do not rewrite metadata
+embedded in ebook files. Updates and imports share a per-library write lock and require `calibredb`
+and a writable library. `update_books` in `list_libraries` reports availability.
 
 ## Docker
 

@@ -51,9 +51,12 @@ browse_library. Every book comes with direct HTTP download URLs for each stored 
 Book ids are per library; omit `library` to use the default one.
 To add a book (when list_libraries reports add_books): call prepare_upload(filename), upload the file's
 bytes with the returned method to upload_url (`curl --fail-with-body -T ./book.epub '<upload_url>'`),
-then call add_book(file_id, …) with optional metadata overrides. A duplicate or an error keeps the upload
-until it expires, so retry add_book without uploading again; ask the user before using
-duplicates=new_record or merge."""
+then call add_book(file_id, …) with optional metadata overrides. Duplicates and failures before import
+keep the upload until expiry, so retry without uploading again. If import succeeds but metadata fails,
+the upload is consumed and the error reports book IDs to retry with update_book. Ask the user before using
+duplicates=new_record or merge. Use update_book(book_id, …) to change an existing book's metadata;
+omitted fields are preserved. Both add_book and update_book accept title, authors, tags, series,
+series_index (series number), languages, identifiers, publisher and description."""
 WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False)
 READ = ToolAnnotations(read_only_hint=True, open_world_hint=False, idempotent_hint=True)
 MEDIA = {".epub": "application/epub+zip", ".mobi": "application/x-mobipocket-ebook",
@@ -88,7 +91,8 @@ def same_origin(request: Request, allowed_hosts: list[str]) -> bool:
 
 def tool_metadata(title: str | None, authors: list[str] | None, tags: list[str] | None,
                   series: str | None, series_index: float | None, languages: list[str] | None,
-                  identifiers: dict[str, str] | None) -> BookMetadata:
+                  identifiers: dict[str, str] | None, publisher: str | None = None,
+                  description: str | None = None, *, updating: bool = False) -> BookMetadata:
     normalized = {}
     for key, value in (identifiers or {}).items():
         key = key.strip().lower()
@@ -97,9 +101,10 @@ def tool_metadata(title: str | None, authors: list[str] | None, tags: list[str] 
         normalized[key] = value
     if series_index is not None and not math.isfinite(series_index):
         raise ToolError("series_index must be finite")
-    metadata = BookMetadata(title, authors, tags, series, series_index, languages, normalized)
+    metadata = BookMetadata(title, authors, tags, series, series_index, languages,
+                            normalized if identifiers is not None else None, publisher, description)
     try:
-        metadata.args()
+        metadata.args(require_series=not updating)
     except AddError as exc:
         raise ToolError(str(exc)) from None
     return metadata
@@ -175,6 +180,7 @@ def build_app(cfg: Config) -> Starlette:
     def list_libraries(ctx: Context) -> dict:
         """The Calibre libraries served here, with book counts and stored formats."""
         return {"default": cat.default, "convert_to_epub": cat.can_convert, "add_books": cat.can_add,
+                "update_books": cat.can_add,
                 "libraries": [{"name": lib.name, "books": lib.count(), "formats": lib.formats()}
                               for lib in cat.libraries.values()]}
 
@@ -236,15 +242,19 @@ def build_app(cfg: Config) -> Starlette:
                        title: str | None = None, authors: list[str] | None = None, tags: list[str] | None = None,
                        series: str | None = None, series_index: float | None = None,
                        languages: list[str] | None = None, identifiers: dict[str, str] | None = None,
-                       duplicates: Literal["refuse", "new_record", "merge"] = "refuse") -> dict:
+                       duplicates: Literal["refuse", "new_record", "merge"] = "refuse",
+                       publisher: str | None = None, description: str | None = None) -> dict:
         """Import a file uploaded via prepare_upload. Metadata overrides the ebook's own.
+        series is the series name; series_index is its number. description accepts text or HTML.
         duplicates: refuse returns status duplicate and keeps the upload; new_record creates another
-        record; merge adds a missing format. Errors keep the upload until expiry for a corrected retry.
+        record; merge adds a missing format. Failures before import keep the upload for retry.
+        If import succeeds but publisher/description fails, use the reported IDs with update_book.
         """
         if not cat.can_add:
             raise ToolError("calibredb is not installed; adding books needs Calibre")
         lib = lib_or_error(library)
-        metadata = tool_metadata(title, authors, tags, series, series_index, languages, identifiers)
+        metadata = tool_metadata(title, authors, tags, series, series_index, languages, identifiers,
+                                 publisher, description)
         try:
             staged = cat.stager.claim(file_id)
         except StagingError as exc:
@@ -252,7 +262,10 @@ def build_app(cfg: Config) -> Starlette:
         try:
             result = await cat.importer.add(lib.root, staged.path, metadata, duplicates)
         except AddError as exc:
-            cat.stager.release(file_id)
+            if exc.changed:
+                cat.stager.consume(file_id)
+            else:
+                cat.stager.release(file_id)
             raise ToolError(str(exc)) from None
         except BaseException:
             cat.stager.release(file_id)
@@ -280,6 +293,37 @@ def build_app(cfg: Config) -> Starlette:
                 + '; the upload is kept — call add_book again with duplicates="new_record" or "merge" '
                 'if the user wants that', "existing": list(existing.values()),
                 "expires_at": cat.stager.expires_at(staged)}
+
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True,
+                                          idempotent_hint=True, open_world_hint=False))
+    async def update_book(book_id: int, ctx: Context, library: str | None = None,
+                          title: str | None = None, authors: list[str] | None = None,
+                          tags: list[str] | None = None, series: str | None = None,
+                          series_index: float | None = None, languages: list[str] | None = None,
+                          identifiers: dict[str, str] | None = None, publisher: str | None = None,
+                          description: str | None = None) -> dict:
+        """Update an existing book's metadata and return its full metadata and download links.
+        Omitted/null fields stay unchanged; supplied lists and identifiers replace existing values.
+        Empty lists/dictionaries clear those fields; empty series/publisher/description clears them.
+        Title must be non-empty. series is the name; series_index is the number and may be set alone.
+        description accepts text or HTML. Changes affect library metadata, not embedded file metadata.
+        """
+        if not cat.can_add:
+            raise ToolError("calibredb is not installed; updating books needs Calibre")
+        lib = lib_or_error(library)
+        if lib.book(book_id) is None:
+            raise ToolError(f"no book {book_id} in library {lib.name!r}")
+        metadata = tool_metadata(title, authors, tags, series, series_index, languages, identifiers,
+                                 publisher, description, updating=True)
+        try:
+            await cat.importer.update(lib.root, book_id, metadata)
+        except AddError as exc:
+            raise ToolError(str(exc)) from None
+        book = lib.book(book_id)
+        if book is None:
+            raise ToolError(f"book {book_id} is no longer readable after updating")
+        book.update(cat.links(lib, book, cat.base_url(ctx.headers)))
+        return book
 
     # -- HTTP -------------------------------------------------------------------------
 

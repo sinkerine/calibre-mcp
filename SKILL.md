@@ -1,6 +1,6 @@
 ---
 name: calibre-add-book
-description: Add ebooks through calibre-mcp using prepare_upload, HTTP PUT, and add_book with optional metadata overrides.
+description: Add ebooks through calibre-mcp using prepare_upload, HTTP PUT, and add_book, or update existing book metadata with update_book.
 ---
 
 # Add a book to Calibre
@@ -39,11 +39,20 @@ The result contains `status: "added"` or `"merged"`, `library`, `file_id`, and `
 metadata and download links. Success consumes the staged upload; the local source file is kept.
 Bytes never go through MCP, and no server path mapping is needed.
 
-Metadata overrides apply only to the import. `authors`, `tags`, and `languages` are lists of strings.
+`add_book` and `update_book` accept the same metadata fields. `authors`, `tags`, and `languages` are lists of strings.
 An author cannot contain `&`; tags and language codes cannot contain commas. `title` must be non-empty.
 `series` is a string; `series_index` is a finite number requiring `series`. `identifiers` is a dictionary:
 keys are unique without regard to case and allow letters, digits, `_`, and `-`; values must be non-empty
-and cannot contain commas. There are no publisher, publication-date, description, rating or cover overrides.
+and cannot contain commas. `publisher` is a string; `description` accepts text or HTML.
+
+To edit an existing book, call `update_book(book_id=42, publisher="Example Press", description="New text",
+series="Example Series", series_index=2.5)`. Omit `library` to use the default. The result is the full
+book metadata and download links. Omitted/null fields stay unchanged; supplied lists and identifiers
+replace existing values. Empty lists/dictionaries clear fields (empty authors become Unknown in Calibre);
+empty series/publisher/description clears those fields. Title must be non-empty. A series number can
+be updated alone when the book already belongs to a series. At least one field is required.
+`list_libraries` reports `update_books` availability. Updates change library metadata, not embedded
+metadata in ebook files.
 
 The default `duplicates="refuse"` returns a normal MCP result with `status: "duplicate"`, `message`,
 matching books in `existing`, and `expires_at`. The file stays staged. Ask the user before retrying
@@ -55,7 +64,9 @@ add a new one. Supply title and author overrides when needed for matching.
 Tool errors keep the upload until expiry: correct metadata or the library and retry `add_book`. An
 unknown or expired id requires a new `prepare_upload` and PUT. An id with no bytes requires PUT first;
 a busy id requires waiting. If Calibre changed the library but returned no readable books, the upload
-is consumed; inspect the library before adding again.
+is consumed; inspect the library before adding again. Publisher and description are applied after
+import/merge. If that metadata step fails, the error reports the imported book IDs and consumes the
+upload; retry the metadata with `update_book`.
 
 PUT errors have JSON `error`: 400 empty/malformed body, 403 foreign browser Origin, 404 unknown/expired
 id, 409 busy upload/import, 413 size limit, 503 unavailable calibredb. Imports report locked libraries,

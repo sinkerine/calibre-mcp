@@ -145,7 +145,7 @@ class CalibreMcpTest(unittest.TestCase):
                 http = httpx2.AsyncClient(transport=transport, base_url="http://calibre.test")
                 async with Client(streamable_http_client("http://calibre.test/mcp", http_client=http)) as client:
                     names = {t.name for t in (await client.list_tools()).tools}
-                    self.assertEqual(names, {"list_libraries", "search_books", "get_book", "browse_library", "prepare_upload", "add_book"})
+                    self.assertEqual(names, {"list_libraries", "search_books", "get_book", "browse_library", "prepare_upload", "add_book", "update_book"})
                     libs = await call(client, "list_libraries")
                     self.assertEqual(libs["libraries"][0]["books"], 3)
                     self.assertEqual(libs["add_books"], self.app.state.catalog.can_add)
@@ -181,8 +181,37 @@ import shutil
 import sqlite3
 import sys
 args = sys.argv[1:]
-assert args[0] == "add"
 root = pathlib.Path(args[args.index("--with-library") + 1])
+if args[0] == "set_metadata":
+    (root / "last-update.json").write_text(json.dumps(args))
+    bid = int(args[-1])
+    db = sqlite3.connect(root / "metadata.db")
+    for i, arg in enumerate(args):
+        if arg != "--field":
+            continue
+        field, _, value = args[i + 1].partition(":")
+        if field in ("title", "series_index"):
+            db.execute(f"UPDATE books SET {field}=? WHERE id=?", (value, bid))
+        elif field == "comments":
+            db.execute("DELETE FROM comments WHERE book=?", (bid,))
+            db.execute("INSERT INTO comments VALUES (NULL,?,?)", (bid, value))
+        elif field == "identifiers":
+            db.execute("DELETE FROM identifiers WHERE book=?", (bid,))
+            for item in filter(None, value.split(",")):
+                key, _, val = item.partition(":")
+                db.execute("INSERT INTO identifiers VALUES (NULL,?,?,?)", (bid, key, val))
+        else:
+            table, column, link = {
+                "authors": ("authors", "name", "author"), "tags": ("tags", "name", "tag"),
+                "series": ("series", "name", "series"), "publisher": ("publishers", "name", "publisher"),
+                "languages": ("languages", "lang_code", "lang_code")}[field]
+            db.execute(f"DELETE FROM books_{table}_link WHERE book=?", (bid,))
+            for val in filter(None, value.split(" & " if field == "authors" else ",")):
+                ident = db.execute(f"INSERT INTO {table} ({column}) VALUES (?)", (val,)).lastrowid
+                db.execute(f"INSERT INTO books_{table}_link (book,{link}) VALUES (?,?)", (bid, ident))
+    db.commit()
+    sys.exit(0)
+assert args[0] == "add"
 src = pathlib.Path(args[args.index("--") + 1])
 (root / "last-args.json").write_text(json.dumps(args))
 def option(key, default):
@@ -265,9 +294,9 @@ class AddBookTest(unittest.TestCase):
         async def run(client, http):
             tools = (await client.list_tools()).tools
             self.assertEqual({t.name for t in tools}, {"list_libraries", "search_books", "get_book",
-                             "browse_library", "prepare_upload", "add_book"})
+                             "browse_library", "prepare_upload", "add_book", "update_book"})
             for tool in tools:
-                self.assertEqual(tool.annotations.read_only_hint, tool.name not in ("prepare_upload", "add_book"))
+                self.assertEqual(tool.annotations.read_only_hint, tool.name not in ("prepare_upload", "add_book", "update_book"))
             libs = await self.call(client, "list_libraries")
             self.assertTrue(libs["add_books"])
             self.assertNotIn("add_url", libs["libraries"][0])
@@ -302,6 +331,66 @@ class AddBookTest(unittest.TestCase):
                                              **metadata))["status"], "duplicate")
             result = await self.call(client, "search_books", query="New Book")
             self.assertEqual(result["total"], 2)
+        self.run_mcp(run)
+
+    def test_new_overrides_and_update(self):
+        async def run(client, http):
+            self.assertTrue((await self.call(client, "list_libraries"))["update_books"])
+            up = await self.stage(client, http)
+            added = await self.call(client, "add_book", file_id=up["file_id"],
+                                    publisher="Publisher", description="<p>A description.</p>")
+            self.assertEqual(added["books"][0]["publisher"], "Publisher")
+            self.assertEqual(added["books"][0]["description"], "A description.")
+            metadata = dict(title="Updated", authors=["Writer", "Other"], tags=["new"],
+                            series="Saga", series_index=2.5, languages=["fra"],
+                            identifiers={" ISBN ": "123", "doi": "x:y"},
+                            publisher="New Publisher", description="<p>New: description</p>")
+            updated = await self.call(client, "update_book", book_id=1, **metadata)
+            for field in ("title", "authors", "tags", "series", "series_index", "languages", "publisher"):
+                self.assertEqual(updated[field], metadata[field])
+            self.assertEqual(updated["identifiers"], {"isbn": "123", "doi": "x:y"})
+            self.assertEqual(updated["description"], "New: description")
+            self.assertEqual((await http.get(updated["downloads"]["EPUB"])).status_code, 200)
+            updated = await self.call(client, "update_book", book_id=1, series_index=0)
+            self.assertEqual(updated["series_index"], 0)
+            self.assertEqual(updated["title"], "Updated")
+            self.assertEqual(updated["publisher"], "New Publisher")
+            cleared = await self.call(client, "update_book", book_id=1, tags=[], languages=[],
+                                      identifiers={}, series="", publisher="", description="")
+            self.assertEqual(cleared["tags"], [])
+            self.assertEqual(cleared["languages"], [])
+            self.assertEqual(cleared["identifiers"], {})
+            self.assertFalse(cleared.get("series"))
+            self.assertFalse(cleared.get("publisher"))
+            self.assertFalse(cleared.get("description"))
+        self.run_mcp(run)
+
+    def test_update_errors(self):
+        from calibre_mcp.importer import AddError
+
+        async def run(client, http):
+            for args, message in (({}, "at least one metadata field"),
+                    ({"title": " "}, "title must not be empty"),
+                    ({"identifiers": {"ISBN": "1", "isbn": "2"}}, "unique when lowercased"),
+                    ({"library": "missing"}, "no library")):
+                await self.call(client, "update_book", book_id=1, error=message, **args)
+            await self.call(client, "update_book", book_id=999, title="X", error="no book 999")
+            cat = self.app.state.catalog
+            with patch.object(cat.importer, "update", AsyncMock(side_effect=AddError("library is locked"))):
+                await self.call(client, "update_book", book_id=1, title="X", error="library is locked")
+            cat.importer._available = False
+            await self.call(client, "update_book", book_id=1, title="X", error="calibredb is not installed")
+        self.run_mcp(run)
+
+    def test_partial_import_consumes_upload(self):
+        from calibre_mcp.importer import AddError
+
+        async def run(client, http):
+            up = await self.stage(client, http)
+            with patch.object(self.app.state.catalog.importer, "add", AsyncMock(side_effect=
+                              AddError("imported, but metadata update failed", changed=True))):
+                await self.call(client, "add_book", file_id=up["file_id"], error="metadata update failed")
+            self.assertNotIn(up["file_id"], self.app.state.catalog.stager._entries)
         self.run_mcp(run)
 
     def test_validation_and_http_guards(self):
